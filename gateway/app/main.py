@@ -99,3 +99,12 @@ if os.path.exists(_config_path):
     app = create_app()  # 生产/容器：config.yaml 已挂载
 else:
     app = None  # 本地开发未提供配置时允许导入（测试显式传 cfg）；uvicorn 启动需先备好配置
+
+
+if __name__ == "__main__":
+    # python -m app.main 独立运行：接线 config.yaml 的 listen_host/listen_port
+    # （容器内仍走 Dockerfile CMD，不受影响）
+    import uvicorn
+
+    cfg = load_config(_config_path)
+    uvicorn.run(app or create_app(cfg), host=cfg.listen_host, port=cfg.listen_port)

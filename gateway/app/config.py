@@ -49,10 +49,6 @@ class AppConfig:
     providers: list[ProviderConfig] = field(default_factory=list)
     failover: FailoverConfig = field(default_factory=FailoverConfig)
 
-    @property
-    def gateway_api_key(self) -> str | None:
-        return os.environ.get("GATEWAY_API_KEY") or None
-
 
 def load_config(
     path: str,

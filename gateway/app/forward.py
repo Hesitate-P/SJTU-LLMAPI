@@ -96,6 +96,14 @@ class GatewayService:
             int((time.monotonic() - start) * 1000), trace or "-",
         )
 
+    def _note_failure(self, provider: ProviderConfig, trace: list[tuple[str, str]],
+                      reason: str) -> None:
+        """网络/SSRF 失败的统一记账：统计、熔断、切换计数与轨迹。"""
+        self.stats.record(provider.name, ErrorKind.NETWORK)
+        self.breaker.record_failure(provider.name, ErrorKind.NETWORK)
+        self.stats.note_switched_away(provider.name)
+        trace.append((provider.name, reason))
+
     async def chat(self, request_body: dict) -> GatewayResponse:
         start = time.monotonic()
         trace: list[tuple[str, str]] = []  # 本次请求的切换轨迹：(provider, 原因)
@@ -139,17 +147,11 @@ class GatewayService:
                     resp = await self._attempt(client, provider, upstream_model, request_body)
                 except ValueError:
                     # SSRF 校验失败：切换下一家
-                    self.stats.record(provider.name, ErrorKind.NETWORK)
-                    self.breaker.record_failure(provider.name, ErrorKind.NETWORK)
-                    self.stats.note_switched_away(provider.name)
-                    trace.append((provider.name, "ssrf"))
+                    self._note_failure(provider, trace, "ssrf")
                     continue
                 except httpx.HTTPError:
                     # 网络故障：切换下一家
-                    self.stats.record(provider.name, ErrorKind.NETWORK)
-                    self.breaker.record_failure(provider.name, ErrorKind.NETWORK)
-                    self.stats.note_switched_away(provider.name)
-                    trace.append((provider.name, "network"))
+                    self._note_failure(provider, trace, "network")
                     continue
                 kind = classify_status(resp.status_code, resp.snippet)
                 self.stats.record(provider.name, kind)

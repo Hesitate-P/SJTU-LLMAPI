@@ -19,7 +19,8 @@ TIMEOUT = httpx.Timeout(30.0, read=300.0)
 
 
 def mask(key: str) -> str:
-    return f"{key[:3]}…{key[-2:]}" if len(key) > 6 else "(short)"
+    # 只输出长度，不落任何密钥字符
+    return f"len={len(key)}"
 
 
 def auth_headers(key: str) -> dict:
@@ -48,10 +49,19 @@ def probe_nonstream(base: str, key: str, model: str, label: str) -> dict:
         "messages": [{"role": "user", "content": "用一句话介绍你自己，然后从1数到5。"}],
         "max_tokens": 200,
     }
-    t0 = time.perf_counter()
-    try:
-        r = httpx.post(f"{base}/chat/completions", headers=auth_headers(key), json=body, timeout=TIMEOUT)
+    for attempt in (1, 2):  # 遇 429 等 35s 重试一次（上游 10 次/分）
+        t0 = time.perf_counter()
+        try:
+            r = httpx.post(f"{base}/chat/completions", headers=auth_headers(key), json=body, timeout=TIMEOUT)
+        except httpx.HTTPError as e:
+            dt = time.perf_counter() - t0
+            print(f"  网络错误 in {dt*1000:.0f}ms: {type(e).__name__}: {e}")
+            return {"model": model, "ok": False, "status": type(e).__name__}
         dt = time.perf_counter() - t0
+        if r.status_code == 429 and attempt == 1:
+            print(f"  HTTP 429 in {dt*1000:.0f}ms  等 35s 后重试一次…")
+            time.sleep(35)
+            continue
         if r.status_code != 200:
             print(f"  HTTP {r.status_code} in {dt*1000:.0f}ms  body[:200]={r.text[:200]!r}")
             return {"model": model, "ok": False, "status": r.status_code}
@@ -64,10 +74,7 @@ def probe_nonstream(base: str, key: str, model: str, label: str) -> dict:
         print(f"  HTTP 200 in {dt*1000:.0f}ms  prompt={pt} completion={ct} tok/s={tps and f'{tps:.1f}'}")
         print(f"  reasoning_content={'有' if has_reasoning else '无'}  reply[:80]={content[:80]!r}")
         return {"model": model, "ok": True, "status": 200, "ms": dt * 1000, "pt": pt, "ct": ct, "tps": tps}
-    except httpx.HTTPError as e:
-        dt = time.perf_counter() - t0
-        print(f"  网络错误 in {dt*1000:.0f}ms: {type(e).__name__}: {e}")
-        return {"model": model, "ok": False, "status": type(e).__name__}
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def probe_stream(base: str, key: str, model: str, label: str) -> dict:
@@ -79,6 +86,15 @@ def probe_stream(base: str, key: str, model: str, label: str) -> dict:
         "messages": [{"role": "user", "content": "从1慢慢数到15，每个数字一行。"}],
         "max_tokens": 300,
     }
+    result = _probe_stream_once(base, key, body)
+    if result.get("status") == 429:
+        print("  HTTP 429  等 35s 后重试一次…")
+        time.sleep(35)
+        result = _probe_stream_once(base, key, body)
+    return {**result, "model": model}
+
+
+def _probe_stream_once(base: str, key: str, body: dict) -> dict:
     t0 = time.perf_counter()
     ttft = None
     chunks = 0
@@ -90,7 +106,7 @@ def probe_stream(base: str, key: str, model: str, label: str) -> dict:
             if r.status_code != 200:
                 text = r.read().decode("utf-8", "replace")
                 print(f"  HTTP {r.status_code}  body[:200]={text[:200]!r}")
-                return {"model": model, "ok": False, "status": r.status_code}
+                return {"ok": False, "status": r.status_code}
             for line in r.iter_lines():
                 if not line or not line.startswith("data:"):
                     continue
@@ -117,16 +133,20 @@ def probe_stream(base: str, key: str, model: str, label: str) -> dict:
         tps = ct / gen_time if ct and gen_time > 0 else None
         print(f"  TTFT={(ttft or 0)*1000:.0f}ms 总时长={dt*1000:.0f}ms chunks={chunks} [DONE]={'✓' if got_done else '✗'}")
         print(f"  usage={usage} 生成段 tok/s={tps and f'{tps:.1f}'}（含网络抖动）")
-        return {"model": model, "ok": True, "ttft_ms": (ttft or 0) * 1000, "total_ms": dt * 1000,
+        return {"ok": True, "status": 200, "ttft_ms": (ttft or 0) * 1000, "total_ms": dt * 1000,
                 "chunks": chunks, "done": got_done, "completion_tokens": ct, "tps": tps}
     except httpx.HTTPError as e:
         print(f"  网络错误: {type(e).__name__}: {e}")
-        return {"model": model, "ok": False, "status": type(e).__name__}
+        return {"ok": False, "status": type(e).__name__}
 
 
 def probe_gateway_provider(base: str, key: str, model: str) -> str:
     body = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
     r = httpx.post(f"{base}/chat/completions", headers=auth_headers(key), json=body, timeout=TIMEOUT)
+    if r.status_code == 429:
+        print(f"  [{model}] HTTP 429  等 35s 后重试一次…")
+        time.sleep(35)
+        r = httpx.post(f"{base}/chat/completions", headers=auth_headers(key), json=body, timeout=TIMEOUT)
     return r.headers.get("x-gateway-provider", "?")
 
 
