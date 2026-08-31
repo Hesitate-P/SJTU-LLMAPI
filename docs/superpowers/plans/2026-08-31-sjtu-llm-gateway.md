@@ -2101,12 +2101,14 @@ Expected 日志：`CHILD_UP` / `established` 字样；若 `AUTHENTICATION_FAILED
 2. `aes128-sha256-modp2048,aes256-sha384-modp2048`
 3. `default`（让 charon 用内置全集）
 
-- [ ] **Step 4: 成功判据**
+- [ ] **Step 4: 成功判据（最终审查修订版）**
 
 Run: `docker compose exec vpn curl -m 8 -s -o /dev/null -w '%{http_code}' https://models.sjtu.edu.cn/api/v1/models`
-Expected: `401` 或 `200`（而非 `000`）——注意本机当前可直连，需同时确认 `docker compose exec vpn ip xfrm state | grep -c esp` ≥ 1 且 charon 日志有 CHILD_UP，证明流量确实走隧道。
-
-> 在校园网内（本机可直连）即使隧道未建立探测也会返回 401——**必须以 xfrm state + CHILD_UP 为准**。
+Expected: `401` 或 `200`（而非 `000`）——注意本机当前可直连，即使隧道未建立探测也会返回 401，**必须以下列四项为准**：
+1. `docker compose exec vpn ip xfrm policy` —— 选择器确为交大 TS（202.120.0.0/16 + 模型 API IP/32），而非 0.0.0.0/0；
+2. `docker compose exec vpn ip xfrm state` 有 esp 状态且其 bytes 计数随请求**增长**（证明流量真的进隧道，非仅 SA 建立）；
+3. 记录学校网关是否分配 VIP（`ip addr` 新增地址 / charon 日志 `virtual IP`）；
+4. 若出现包绕过隧道（`install_routes = no` 下源地址选择不匹配 xfrm 模板的明文绕过陷阱）：当场决策翻转 `no-routes.conf` 为 `install_routes = yes`——remote_ts 已显式协商、IKEv2 narrowing 只缩不放，不会接管默认路由；翻转后重复 1-3 验证并记入 spike 笔记。
 
 - [ ] **Step 5: 断网自愈验证（可选，校外环境下做最有意义）**
 

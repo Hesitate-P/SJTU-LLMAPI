@@ -25,6 +25,12 @@ Reference files:
 - The API key is **masked** in the notification files; the real key lives with the user. Never hardcode a key — read it from an environment variable (e.g., `SJTU_API_KEY`) or an untracked secrets file. Never print or echo key values into files, logs, or this AGENTS.md.
 - Files use Chinese names; keep filenames and content UTF-8 safe in any tooling.
 
-## Build / test
+## 项目：sjtu-llm-gateway（本地 LLM API 转发网关）
 
-None yet — no package manager, linter, or test framework is set up. When the first project is added, record its commands here.
+OpenAI 兼容本地网关（`gateway/`，Python 3.13 + FastAPI）+ 应用内 strongSwan IKEv2 隧道容器（`vpn/`）+ Compose 编排（共享网络命名空间，宿主仅 `127.0.0.1:8000`）。交大 API 优先，429/配额/5xx/网络错误自动切换到可配置的备用供应商（`config.yaml`）。
+
+- 设计文档：`docs/superpowers/specs/2026-08-31-sjtu-llm-gateway-design.md`；实现计划：`docs/superpowers/plans/2026-08-31-sjtu-llm-gateway.md`
+- 网关测试：`cd gateway && uv run pytest`
+- 全栈启动：`cp .env.example .env && cp config.example.yaml config.yaml`（填密钥）→ `docker compose up -d`；排障 `docker compose logs -f vpn gateway`；`curl http://127.0.0.1:8000/health`（免鉴权）
+- **待办**：Task 13（真实 IKEv2 spike，需 `.env` 的 `VPN_USERNAME/VPN_PASSWORD`，验证清单见计划 Task 13 Step 4 修订版）与 Task 14（端到端验收，需 `SJTU_API_KEY`；派发时须附带一行修复：`main.py` 模块导入处 `logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")`，否则生产部署下 INFO 请求日志不输出）
+- 已知合并后积压项：见 `.superpowers/sdd/2026-08-31-sjtu-llm-gateway/progress.md` 的 minor triage（若该目录已删，见 git 历史最终审查条目）
