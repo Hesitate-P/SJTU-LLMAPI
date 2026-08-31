@@ -1,0 +1,35 @@
+services:
+  vpn:
+    build: ./vpn
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file: .env
+    environment:
+      VPN_SERVER: stu.vpn.sjtu.edu.cn
+      VPN_ROUTE_SUBNETS: 202.120.0.0/16
+      VPN_EXTRA_HOSTS: models.sjtu.edu.cn
+    ports:
+      - "127.0.0.1:8000:8000"   # 端口由 vpn 服务发布（网关共享其 netns）
+    restart: unless-stopped
+    healthcheck:
+      # $$ 为 compose 转义：运行时命令为
+      # code=$(curl -m 8 -s -o /dev/null -w '%{http_code}' https://models.sjtu.edu.cn/api/v1/models) || code=000; [ "$code" != "000" ]
+      # 任意 HTTP 状态码（200/401/403…）即视为隧道通，仅 000（网络失败）判不健康（与 entrypoint 探测一致）。
+      test: ["CMD-SHELL", "code=$$(curl -m 8 -s -o /dev/null -w '%{http_code}' https://models.sjtu.edu.cn/api/v1/models) || code=000; [ \"$$code\" != \"000\" ]"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 45s
+
+  gateway:
+    build: ./gateway
+    network_mode: "service:vpn"
+    env_file: .env
+    environment:
+      GATEWAY_CONFIG: /app/config.yaml
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+    depends_on:
+      - vpn
