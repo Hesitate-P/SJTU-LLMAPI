@@ -1,14 +1,88 @@
-from fastapi import FastAPI
+"""FastAPI 入口：本地 OpenAI 兼容端点。"""
+from __future__ import annotations
+
+import os
+
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from .config import AppConfig, load_config
+from .failover import Breaker
+from .forward import GatewayResponse, GatewayService
+from .ratelimit import TokenBucket
+from .stats import Stats
 
 
-def create_app() -> FastAPI:
+def _build_service(cfg: AppConfig) -> GatewayService:
+    breaker = Breaker(
+        cfg.failover.cooldown_429_seconds,
+        cfg.failover.cooldown_quota_seconds,
+        cfg.failover.cooldown_network_seconds,
+    )
+    buckets: dict[str, TokenBucket] = {}
+    for p in cfg.providers:
+        if p.proactive_rate_limit:
+            buckets[p.name] = TokenBucket(
+                p.proactive_rate_limit.requests_per_minute,
+                p.proactive_rate_limit.burst,
+            )
+    return GatewayService(cfg, breaker, Stats(), buckets)
+
+
+def create_app(cfg: AppConfig | None = None, service: GatewayService | None = None) -> FastAPI:
+    cfg = cfg or load_config(os.environ.get("GATEWAY_CONFIG", "config.yaml"))
+    service = service or _build_service(cfg)
     app = FastAPI(title="sjtu-llm-gateway")
+
+    @app.middleware("http")
+    async def require_gateway_key(request: Request, call_next):
+        expected = os.environ.get("GATEWAY_API_KEY")
+        if expected:
+            supplied = request.headers.get("authorization", "")
+            if supplied != f"Bearer {expected}":
+                return JSONResponse(status_code=401, content={
+                    "error": {"message": "无效的网关密钥",
+                              "type": "invalid_request_error"}})
+        return await call_next(request)
+
+    def _to_response(result: GatewayResponse) -> Response:
+        headers = {"X-Gateway-Provider": result.provider}
+        if result.stream is not None:
+            return StreamingResponse(result.stream, status_code=result.status_code,
+                                     media_type=result.media_type, headers=headers)
+        return Response(content=result.body, status_code=result.status_code,
+                        media_type=result.media_type, headers=headers)
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> Response:
+        body = await request.json()
+        return _to_response(await service.chat(body))
+
+    @app.get("/v1/models")
+    async def models() -> Response:
+        return _to_response(await service.list_models())
 
     @app.get("/health")
     async def health() -> dict:
-        return {"status": "ok"}
+        providers = {}
+        for p in cfg.providers:
+            providers[p.name] = {
+                "available": p.available,
+                "breaker_open": service.breaker.is_open(p.name),
+                "cooldown_remaining": round(service.breaker.cooldown_remaining(p.name), 1),
+                "unavailable_reason": p.unavailable_reason or None,
+            }
+        return {"status": "ok", "providers": providers}
+
+    @app.get("/stats")
+    async def stats() -> dict:
+        return service.stats.snapshot()
 
     return app
 
 
-app = create_app()
+_config_path = os.environ.get("GATEWAY_CONFIG", "config.yaml")
+if os.path.exists(_config_path):
+    app = create_app()  # 生产/容器：config.yaml 已挂载
+else:
+    app = None  # 本地开发未提供配置时允许导入（测试显式传 cfg）；uvicorn 启动需先备好配置
