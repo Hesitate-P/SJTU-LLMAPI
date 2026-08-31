@@ -78,7 +78,7 @@ resp = client.chat.completions.create(model="deepseek-chat",
 | 上游情况 | 网关行为 |
 |---|---|
 | 429 | 该供应商熔断 60s，立即换下一候选重试 |
-| 配额类（402 或 429 响应体含 quota/insufficient/balance/exhausted/额度/配额） | 熔断 30min，换下一候选 |
+| 配额类（402，或任意 4xx 响应体含 quota/insufficient/balance/exhausted/额度/配额） | 熔断 30min，换下一候选 |
 | 5xx / 连接失败 / 超时 / SSRF 校验失败 | 熔断 15s，换下一候选 |
 | 4xx（请求本身问题） | 原样透传，不切换 |
 | 流式已开始（首块已发出）后中断 | 不重试（避免重复输出），透传错误并将该供应商熔断 15s |

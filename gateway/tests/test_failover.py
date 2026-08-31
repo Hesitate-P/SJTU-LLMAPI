@@ -17,6 +17,12 @@ def test_429_with_quota_body_is_quota(body):
     assert classify_status(429, body) is ErrorKind.QUOTA
 
 
+def test_any_4xx_with_quota_body_is_quota():
+    assert classify_status(403, "insufficient balance") is ErrorKind.QUOTA
+    assert classify_status(400, "quota exceeded") is ErrorKind.QUOTA
+    assert classify_status(403, "forbidden") is ErrorKind.CLIENT  # 无关键词仍是 CLIENT
+
+
 def test_breaker_opens_and_expires():
     breaker = Breaker(cooldown_429=60.0)
     breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=100.0)

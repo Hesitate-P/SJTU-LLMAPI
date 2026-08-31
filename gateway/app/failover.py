@@ -17,17 +17,17 @@ class ErrorKind(str, enum.Enum):
 
 
 def classify_status(status: int, body_snippet: str = "") -> ErrorKind:
-    if status == 429:
-        low = body_snippet.lower()
-        if any(k in low for k in _QUOTA_KEYWORDS):
+    if 400 <= status <= 499:
+        if status == 402:
             return ErrorKind.QUOTA
-        return ErrorKind.RATE_LIMIT
-    if status == 402:
-        return ErrorKind.QUOTA
+        # 配额关键词扫描覆盖全部 4xx（部分供应商用 403/400 报余额不足）
+        if any(k in body_snippet.lower() for k in _QUOTA_KEYWORDS):
+            return ErrorKind.QUOTA
+        if status == 429:
+            return ErrorKind.RATE_LIMIT
+        return ErrorKind.CLIENT
     if 500 <= status <= 599:
         return ErrorKind.SERVER
-    if 400 <= status <= 499:
-        return ErrorKind.CLIENT
     if 200 <= status <= 299:
         return ErrorKind.OK
     return ErrorKind.SERVER
