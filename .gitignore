@@ -1,0 +1,13 @@
+# 密钥与真实配置，严禁入库
+.env
+config.yaml
+
+# 个人通知文件（含个人信息）
+*.txt
+
+# 运行时/工具
+.mimosa/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
