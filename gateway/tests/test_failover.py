@@ -58,3 +58,48 @@ def test_short_cooldown_inside_long_window_returns_effective_deadline():
     assert breaker.record_failure("p", ErrorKind.QUOTA, now=100.0) == 1900.0
     assert breaker.record_failure("p", ErrorKind.RATE_LIMIT, now=200.0) == 1900.0  # 不是 260.0
     assert breaker.cooldown_remaining("p", now=200.0) == 1700.0
+
+
+def test_acquire_probe_rejects_during_cooldown():
+    breaker = Breaker(cooldown_429=10.0)
+    breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=0)
+    assert breaker.acquire_probe("sjtu", now=5) is False
+
+
+def test_acquire_probe_never_opened_allows_all():
+    breaker = Breaker()
+    assert breaker.acquire_probe("sjtu", now=1) is True
+    assert breaker.acquire_probe("sjtu", now=1) is True  # 从未打开：不设探测标志，全放行
+    assert breaker.is_open("sjtu", now=1) is False
+
+
+def test_half_open_single_probe_admission():
+    breaker = Breaker(cooldown_429=10.0)
+    breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=0)
+    assert breaker.acquire_probe("sjtu", now=11) is True   # 到期首人成为唯一探测
+    assert breaker.acquire_probe("sjtu", now=11) is False  # 并发他人被拒（真半开）
+    assert breaker.is_open("sjtu", now=11) is True         # 探测中对外仍视为开
+
+    breaker.record_success("sjtu")  # 探测成功
+    assert breaker.is_open("sjtu", now=11) is False
+    assert breaker.acquire_probe("sjtu", now=11) is True
+    assert breaker.acquire_probe("sjtu", now=11) is True   # 恢复全放行
+
+
+def test_half_open_probe_failure_recools_and_clears_probing():
+    breaker = Breaker(cooldown_429=10.0, cooldown_network=15.0)
+    breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=0)
+    assert breaker.acquire_probe("sjtu", now=11) is True
+    breaker.record_failure("sjtu", ErrorKind.NETWORK, now=11)  # 探测失败
+    assert breaker.is_open("sjtu", now=20) is True          # 重新冷却
+    assert breaker.acquire_probe("sjtu", now=20) is False
+    assert breaker.acquire_probe("sjtu", now=26.1) is True  # probing 已清，到期可再探
+
+
+def test_release_probe_allows_next_probe():
+    breaker = Breaker(cooldown_429=10.0)
+    breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=0)
+    assert breaker.acquire_probe("sjtu", now=11) is True
+    breaker.release_probe("sjtu")  # 探测者放弃（如软饱和）
+    assert breaker.is_open("sjtu", now=11) is False
+    assert breaker.acquire_probe("sjtu", now=11) is True  # 释放后下一请求可再探

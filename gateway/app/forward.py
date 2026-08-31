@@ -122,14 +122,15 @@ class GatewayService:
         handed_over = False
         try:
             for provider, upstream_model in chain:
-                if self.breaker.is_open(provider.name):
-                    # 熔断跳过：本轮未尝试该供应商，无本请求内的原因，不入 trace
+                if not self.breaker.acquire_probe(provider.name):
+                    # 熔断/半开准入失败：本轮未尝试该供应商，无本请求内的原因，不入 trace
                     continue
                 bucket = self.buckets.get(provider.name)
                 if bucket is not None:
                     max_wait = (provider.proactive_rate_limit.max_wait_seconds
                                 if provider.proactive_rate_limit else 2.0)
                     if not await bucket.acquire(max_wait):
+                        self.breaker.release_probe(provider.name)  # 探测者放弃，允许他人再探
                         self.stats.note_soft_saturation(provider.name)
                         self.stats.note_switched_away(provider.name)
                         trace.append((provider.name, "soft_saturated"))
@@ -153,12 +154,14 @@ class GatewayService:
                 kind = classify_status(resp.status_code, resp.snippet)
                 self.stats.record(provider.name, kind)
                 if kind is ErrorKind.OK:
+                    self.breaker.record_success(provider.name)  # 能应答即活着（半开探测成功）
                     if resp.stream is not None:
                         # 流式响应：client 所有权移交给流生成器，由其关闭
                         handed_over = True
                     self._log_chat(model, chain_repr, resp, trace, start)
                     return resp
                 if kind is ErrorKind.CLIENT:
+                    self.breaker.record_success(provider.name)  # 能应答即活着
                     self._log_chat(model, chain_repr, resp, trace, start)
                     return resp  # 请求问题：透传，不切换
                 self.breaker.record_failure(provider.name, kind)
@@ -235,6 +238,16 @@ class GatewayService:
                 yield first
                 async for chunk in chunks:
                     yield chunk
+            except Exception as exc:
+                # 流中死亡（GeneratorExit 属 BaseException，不会进此分支）：
+                # 记熔断与统计后再透传，避免死供应商仍居最高优先
+                self.breaker.record_failure(provider.name, ErrorKind.NETWORK)
+                self.stats.note_midstream_error(provider.name)
+                logger.warning("stream interrupted model=%s provider=%s err=%s",
+                               request_body.get("model"), provider.name, exc)
+                raise
+            else:
+                self.breaker.record_success(provider.name)  # 完整送达：活着
             finally:
                 # aclose 自身可能失败（连接已断），抑制之以免屏蔽原始异常
                 with contextlib.suppress(Exception):

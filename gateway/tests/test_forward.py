@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -22,6 +24,17 @@ def make_service(handler, cfg=None):
     cfg = cfg or make_cfg()
     return GatewayService(
         cfg, Breaker(), Stats(), {},
+        client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)),
+        resolver=lambda host: ["93.184.216.34"],
+    )
+
+
+def explicit_service(handler, breaker, stats, cfg=None):
+    """显式注入 breaker/stats，便于断言熔断与统计副作用。"""
+    cfg = cfg or make_cfg()
+    return GatewayService(
+        cfg, breaker, stats, {},
         client_factory=lambda: httpx.AsyncClient(
             transport=httpx.MockTransport(handler)),
         resolver=lambda host: ["93.184.216.34"],
@@ -169,7 +182,10 @@ async def test_stream_break_after_first_chunk_not_retried(monkeypatch):
             return httpx.Response(200, content=broken())
         return httpx.Response(200, json={"ok": True})
 
-    result = await make_service(handler).chat({"model": "m1", "stream": True})
+    breaker = Breaker()
+    stats = Stats()
+    service = explicit_service(handler, breaker, stats)
+    result = await service.chat({"model": "m1", "stream": True})
     assert result.provider == "sjtu"  # 首块后已提交，不再换家
     received = []
     with pytest.raises(httpx.HTTPError):
@@ -177,6 +193,74 @@ async def test_stream_break_after_first_chunk_not_retried(monkeypatch):
             received.append(chunk)
     assert received == [b"data: first\n\n"]
     assert calls == ["sjtu.test"]
+    assert breaker.is_open("sjtu") is True  # 流中断记熔断
+    assert stats.snapshot()["sjtu"]["network_errors"] >= 1  # 记统计（不双计 requests）
+
+
+async def test_stream_completion_records_success(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+
+    async def gen():
+        yield b"data: one\n\n"
+        yield b"data: two\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=gen())
+
+    breaker = Breaker()
+    service = explicit_service(handler, breaker, Stats())
+    result = await service.chat({"model": "m1", "stream": True})
+    assert result.provider == "sjtu"
+    first = await anext(result.stream)  # 首块
+    assert first == b"data: one\n\n"
+    breaker.record_failure("sjtu", ErrorKind.NETWORK)  # 消费期间进入冷却
+    assert breaker.is_open("sjtu") is True
+    rest = [chunk async for chunk in result.stream]  # 正常消费完剩余块
+    assert rest == [b"data: two\n\n"]
+    assert breaker.is_open("sjtu") is False  # 流正常完成 → record_success 恢复
+
+
+async def test_half_open_single_probe_after_cooldown_expiry(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "d")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        if request.url.host == "sjtu.test":
+            return httpx.Response(429, json={"error": "no"})
+        return httpx.Response(200, json={"ok": True})
+
+    breaker = Breaker()
+    breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=time.monotonic() - 3600)
+    service = explicit_service(handler, breaker, Stats())
+    r1 = await service.chat({"model": "m1"})
+    assert r1.provider == "deepseek"
+    assert calls == ["sjtu.test", "deepseek.test"]  # 首个请求以探测身份触了 sjtu
+
+    calls.clear()
+    r2 = await service.chat({"model": "m1"})
+    assert r2.provider == "deepseek"
+    assert calls == ["deepseek.test"]  # 探测失败已再冷却：不再触 sjtu
+
+
+async def test_half_open_concurrent_requests_only_one_probes(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "d")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(200, json={"ok": True})
+
+    breaker = Breaker()
+    breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=time.monotonic() - 3600)
+    service = explicit_service(handler, breaker, Stats())
+    r1, r2 = await asyncio.gather(service.chat({"model": "m1"}),
+                                  service.chat({"model": "m1"}))
+    # 冷却刚到期的并发请求：恰一个探测 sjtu，另一个直接走 deepseek
+    assert sorted(r.provider for r in (r1, r2)) == ["deepseek", "sjtu"]
+    assert sorted(calls) == ["deepseek.test", "sjtu.test"]
 
 
 async def test_quota_body_triggers_long_cooldown(monkeypatch):

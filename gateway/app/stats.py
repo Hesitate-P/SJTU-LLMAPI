@@ -33,5 +33,9 @@ class Stats:
     def note_soft_saturation(self, provider: str) -> None:
         self._bucket(provider)["soft_saturated"] += 1
 
+    def note_midstream_error(self, provider: str) -> None:
+        # 只记网络错误，不加 requests：该请求在 chat() 已计过一次，避免双计
+        self._bucket(provider)["network_errors"] += 1
+
     def snapshot(self) -> dict:
         return {name: dict(b) for name, b in self._data.items()}
