@@ -60,11 +60,20 @@ swanctl --initiate --child sjtu || echo "[vpn] 首次发起失败，进入保活
 # 5. 隧道路由维护：对每个网段，经容器网关走 table 220，源地址用当前 VIP。
 #    内核按"src=VIP 命中 xfrm policy(src=VIP/32,dst=0/0)"决定进隧道；
 #    其余流量走 main 表（src=容器 IP，不命中 policy）直连。
-#    VIP 由学校网关动态分配且重拨会变，所以每次保活循环都刷新。
+#    VIP 权威来源 = xfrm out 方向 policy 的 src 字段（即内核要求命中的源地址），零假设；
+#    不要从 ip addr 猜（自定义网络 10.x/192.168.x 下会把容器自身 IP 误当 VIP，
+#    写出错误 src 的路由 → 交大流量静默退化为直连且无告警）。
+#    VIP 由学校网关动态分配且重拨会变，所以每次保活循环都刷新；
+#    识别失败时只告警不写路由（宁缺勿错），下一轮重试。
 ensure_routes() {
-    vip="$(ip -4 addr show dev eth0 | awk '/inet /{print $2}' | cut -d/ -f1 | grep -v '^172\.' | tail -1)"
-    if [ -z "$vip" ]; then
-        return 0  # 隧道未建立（无 VIP），无可操作
+    vip="$(ip xfrm policy 2>/dev/null \
+        | awk '$1 == "src" {s = $2} $1 == "dir" && $2 == "out" {print s}' \
+        | head -1 | cut -d/ -f1)"
+    if [ -z "$vip" ] || [ "$vip" = "0.0.0.0" ]; then
+        if swanctl --list-sas 2>/dev/null | grep -q "INSTALLED"; then
+            echo "[vpn] 警告: CHILD 已安装但未能从 xfrm policy 识别 VIP，跳过路由刷新（宁缺勿错）"
+        fi
+        return 0
     fi
     gw="$(ip route show default | awk '{print $3; exit}')"
     ip rule show | grep -q "lookup 220" || ip rule add priority 220 table 220
