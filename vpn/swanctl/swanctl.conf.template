@@ -8,6 +8,8 @@ connections {
         send_cert = never
         fragmentation = yes
         mobike = yes
+        # DPD 间隔是 connection 级参数；默认 0（关闭）会使 children 的 dpd_action 永不触发
+        dpd_delay = 30s
         local {
             auth = eap-mschapv2
             eap_id = ${VPN_USERNAME}
