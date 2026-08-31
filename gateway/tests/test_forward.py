@@ -263,6 +263,46 @@ async def test_half_open_concurrent_requests_only_one_probes(monkeypatch):
     assert sorted(calls) == ["deepseek.test", "sjtu.test"]
 
 
+async def test_probe_flag_released_on_unexpected_error(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("unexpected bug")  # 非 OSError/ValueError/httpx：逃出既有 except
+
+    breaker = Breaker()
+    breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=time.monotonic() - 3600)
+    service = explicit_service(handler, breaker, Stats())
+    with pytest.raises(RuntimeError):
+        await service.chat({"model": "m1"})
+    # 探测者异常退出后 probing 标志必须已释放：供应商未被永久卡死
+    assert breaker.acquire_probe("sjtu") is True
+
+
+async def test_dns_oserror_fails_over(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "d")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    def resolver(host: str) -> list[str]:
+        if host == "sjtu.test":
+            raise OSError("dns fail")  # 模拟 getaddrinfo 的 gaierror（OSError 子类）
+        return ["93.184.216.34"]
+
+    cfg = make_cfg()
+    breaker = Breaker()
+    stats = Stats()
+    service = GatewayService(cfg, breaker, stats, {},
+                             client_factory=lambda: httpx.AsyncClient(
+                                 transport=httpx.MockTransport(handler)),
+                             resolver=resolver)
+    result = await service.chat({"model": "m1"})
+    assert result.provider == "deepseek"  # DNS 故障切换而非裸 500
+    assert stats.snapshot()["sjtu"]["network_errors"] >= 1
+    assert breaker.is_open("sjtu") is True  # 记 NETWORK 冷却
+
+
 async def test_quota_body_triggers_long_cooldown(monkeypatch):
     monkeypatch.setenv("SJTU_API_KEY", "s")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "d")

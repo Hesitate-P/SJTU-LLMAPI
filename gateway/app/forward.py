@@ -133,42 +133,50 @@ class GatewayService:
                 if not self.breaker.acquire_probe(provider.name):
                     # 熔断/半开准入失败：本轮未尝试该供应商，无本请求内的原因，不入 trace
                     continue
-                bucket = self.buckets.get(provider.name)
-                if bucket is not None:
-                    max_wait = (provider.proactive_rate_limit.max_wait_seconds
-                                if provider.proactive_rate_limit else 2.0)
-                    if not await bucket.acquire(max_wait):
-                        self.breaker.release_probe(provider.name)  # 探测者放弃，允许他人再探
-                        self.stats.note_soft_saturation(provider.name)
-                        self.stats.note_switched_away(provider.name)
-                        trace.append((provider.name, "soft_saturated"))
-                        continue
+                # 单个供应商的 attempt 段（bucket 获取 → 分类记账完成）：
+                # 任何逃出下方各 except 的异常（CancelledError、未预期 bug 等）
+                # 都必须释放半开探测标志，否则该供应商会被 probing 永久卡死。
                 try:
-                    resp = await self._attempt(client, provider, upstream_model, request_body)
-                except ValueError:
-                    # SSRF 校验失败：切换下一家
-                    self._note_failure(provider, trace, "ssrf")
-                    continue
-                except httpx.HTTPError:
-                    # 网络故障：切换下一家
-                    self._note_failure(provider, trace, "network")
-                    continue
-                kind = classify_status(resp.status_code, resp.snippet)
-                self.stats.record(provider.name, kind)
-                if kind is ErrorKind.OK:
-                    self.breaker.record_success(provider.name)  # 能应答即活着（半开探测成功）
-                    if resp.stream is not None:
-                        # 流式响应：client 所有权移交给流生成器，由其关闭
-                        handed_over = True
-                    self._log_chat(model, chain_repr, resp, trace, start)
-                    return resp
-                if kind is ErrorKind.CLIENT:
-                    self.breaker.record_success(provider.name)  # 能应答即活着
-                    self._log_chat(model, chain_repr, resp, trace, start)
-                    return resp  # 请求问题：透传，不切换
-                self.breaker.record_failure(provider.name, kind)
-                self.stats.note_switched_away(provider.name)
-                trace.append((provider.name, _SWITCH_REASON[kind]))
+                    bucket = self.buckets.get(provider.name)
+                    if bucket is not None:
+                        max_wait = (provider.proactive_rate_limit.max_wait_seconds
+                                    if provider.proactive_rate_limit else 2.0)
+                        if not await bucket.acquire(max_wait):
+                            self.breaker.release_probe(provider.name)  # 探测者放弃，允许他人再探
+                            self.stats.note_soft_saturation(provider.name)
+                            self.stats.note_switched_away(provider.name)
+                            trace.append((provider.name, "soft_saturated"))
+                            continue
+                    try:
+                        resp = await self._attempt(client, provider, upstream_model, request_body)
+                    except ValueError:
+                        # SSRF 校验失败：切换下一家
+                        self._note_failure(provider, trace, "ssrf")
+                        continue
+                    except (httpx.HTTPError, OSError):
+                        # 网络故障 / DNS·系统错误（getaddrinfo 的 gaierror 属 OSError）：切换下一家
+                        self._note_failure(provider, trace, "network")
+                        continue
+                    kind = classify_status(resp.status_code, resp.snippet)
+                    self.stats.record(provider.name, kind)
+                    if kind is ErrorKind.OK:
+                        self.breaker.record_success(provider.name)  # 能应答即活着（半开探测成功）
+                        if resp.stream is not None:
+                            # 流式响应：client 所有权移交给流生成器，由其关闭
+                            handed_over = True
+                        self._log_chat(model, chain_repr, resp, trace, start)
+                        return resp
+                    if kind is ErrorKind.CLIENT:
+                        self.breaker.record_success(provider.name)  # 能应答即活着
+                        self._log_chat(model, chain_repr, resp, trace, start)
+                        return resp  # 请求问题：透传，不切换
+                    self.breaker.record_failure(provider.name, kind)
+                    self.stats.note_switched_away(provider.name)
+                    trace.append((provider.name, _SWITCH_REASON[kind]))
+                except BaseException:
+                    # 只保证探测标志释放，不吞异常
+                    self.breaker.release_probe(provider.name)
+                    raise
         finally:
             if not handed_over:
                 await client.aclose()
