@@ -7,9 +7,11 @@ connections {
         proposals = aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp1024,default
         send_cert = never
         fragmentation = yes
-        mobike = yes
+        mobike = no
         # DPD 间隔是 connection 级参数；默认 0（关闭）会使 children 的 dpd_action 永不触发
         dpd_delay = 30s
+        # 学校网关要求客户端在 IKE_AUTH 里请求配置载荷（FAILED_CP_REQUIRED），需申请虚拟 IP
+        vips = 0.0.0.0
         local {
             auth = eap-mschapv2
             eap_id = ${VPN_USERNAME}
@@ -19,9 +21,13 @@ connections {
         }
         children {
             sjtu {
-                # 关键：流量选择器只圈定交大网段，不做默认路由接管
-                remote_ts = ${VPN_TS}
-                start_action = none
+                # 学校网关强制全隧道：TS 收窄为交大网段时协商虽成功，但数据面被静默丢弃
+                # （出方向 ESP 有计数、入方向永远为 0）。必须协商 0.0.0.0/0；
+                # "只让交大流量走隧道"由 entrypoint.sh 的 table 220 路由实现，不会接管默认路由。
+                remote_ts = 0.0.0.0/0
+                # start（加载即拨号）：校园网内探测 URL 直连也通（401），失败驱动型重连不会触发，
+                # 必须主动建立；start 也是 dpd_action/close_action 重启的前提
+                start_action = start
                 dpd_action = restart
                 close_action = restart
             }
