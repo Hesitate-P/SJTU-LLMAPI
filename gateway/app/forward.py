@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
@@ -16,6 +18,15 @@ from .providers import build_chain
 from .ratelimit import TokenBucket
 from .security import assert_safe_upstream_url
 from .stats import Stats
+
+logger = logging.getLogger("gateway")
+
+# 切换原因（错误分类 -> 轨迹标签）；CLIENT 透传与成功不产生切换
+_SWITCH_REASON = {
+    ErrorKind.RATE_LIMIT: "rate_limited",
+    ErrorKind.QUOTA: "quota",
+    ErrorKind.SERVER: "server",
+}
 
 
 @dataclass
@@ -69,18 +80,41 @@ class GatewayService:
             )
         )
 
+    def _log_chat(
+        self,
+        model: object,
+        chain_repr: str,
+        result: GatewayResponse,
+        trace: list[tuple[str, str]],
+        start: float,
+    ) -> None:
+        """单次请求的结构化日志（脱敏：绝不记 Authorization/API key/密钥值）。
+        流式响应在返回前记 status=200；流中途中断不补记（保持简单）。"""
+        logger.info(
+            "model=%s chain=%s provider=%s status=%s elapsed_ms=%d switch_trace=%s",
+            model, chain_repr, result.provider, result.status_code,
+            int((time.monotonic() - start) * 1000), trace or "-",
+        )
+
     async def chat(self, request_body: dict) -> GatewayResponse:
+        start = time.monotonic()
+        trace: list[tuple[str, str]] = []  # 本次请求的切换轨迹：(provider, 原因)
         model = request_body.get("model")
         if not isinstance(model, str) or not model:
-            return GatewayResponse(
+            result = GatewayResponse(
                 400, "application/json", "local",
                 body=_openai_error("请求体缺少 model 字段", "invalid_request_error"))
+            self._log_chat(model, "-", result, trace, start)
+            return result
         chain = build_chain(self.cfg, model)
+        chain_repr = "->".join(p.name for p, _ in chain) or "-"
         if not chain:
-            return GatewayResponse(
+            result = GatewayResponse(
                 404, "application/json", "local",
                 body=_openai_error(f"没有供应商提供模型 {model}",
                                    "invalid_request_error", "model_not_found"))
+            self._log_chat(model, chain_repr, result, trace, start)
+            return result
 
         # 手动持有 client：流式响应会把所有权移交给流生成器（由其最终关闭），
         # 其余路径在 finally 统一关闭；循环内的 continue 天然复用同一 client。
@@ -89,6 +123,7 @@ class GatewayService:
         try:
             for provider, upstream_model in chain:
                 if self.breaker.is_open(provider.name):
+                    # 熔断跳过：本轮未尝试该供应商，无本请求内的原因，不入 trace
                     continue
                 bucket = self.buckets.get(provider.name)
                 if bucket is not None:
@@ -97,14 +132,23 @@ class GatewayService:
                     if not await bucket.acquire(max_wait):
                         self.stats.note_soft_saturation(provider.name)
                         self.stats.note_switched_away(provider.name)
+                        trace.append((provider.name, "soft_saturated"))
                         continue
                 try:
                     resp = await self._attempt(client, provider, upstream_model, request_body)
-                except (httpx.HTTPError, ValueError):
-                    # SSRF 校验失败或网络故障：切换下一家
+                except ValueError:
+                    # SSRF 校验失败：切换下一家
                     self.stats.record(provider.name, ErrorKind.NETWORK)
                     self.breaker.record_failure(provider.name, ErrorKind.NETWORK)
                     self.stats.note_switched_away(provider.name)
+                    trace.append((provider.name, "ssrf"))
+                    continue
+                except httpx.HTTPError:
+                    # 网络故障：切换下一家
+                    self.stats.record(provider.name, ErrorKind.NETWORK)
+                    self.breaker.record_failure(provider.name, ErrorKind.NETWORK)
+                    self.stats.note_switched_away(provider.name)
+                    trace.append((provider.name, "network"))
                     continue
                 kind = classify_status(resp.status_code, resp.snippet)
                 self.stats.record(provider.name, kind)
@@ -112,19 +156,24 @@ class GatewayService:
                     if resp.stream is not None:
                         # 流式响应：client 所有权移交给流生成器，由其关闭
                         handed_over = True
+                    self._log_chat(model, chain_repr, resp, trace, start)
                     return resp
                 if kind is ErrorKind.CLIENT:
+                    self._log_chat(model, chain_repr, resp, trace, start)
                     return resp  # 请求问题：透传，不切换
                 self.breaker.record_failure(provider.name, kind)
                 self.stats.note_switched_away(provider.name)
+                trace.append((provider.name, _SWITCH_REASON[kind]))
         finally:
             if not handed_over:
                 await client.aclose()
 
-        return GatewayResponse(
+        result = GatewayResponse(
             502, "application/json", "local",
             body=_openai_error("所有候选供应商当前不可用（熔断或网络故障）",
                                "gateway_error", "all_providers_failed"))
+        self._log_chat(model, chain_repr, result, trace, start)
+        return result
 
     async def _attempt(
         self,

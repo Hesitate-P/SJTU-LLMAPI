@@ -1,6 +1,7 @@
 """config.yaml 加载与校验。密钥只从环境变量读，绝不落盘。"""
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -8,6 +9,8 @@ from dataclasses import dataclass, field
 import yaml
 
 from .security import assert_safe_upstream_url
+
+logger = logging.getLogger("gateway")
 
 
 @dataclass
@@ -105,6 +108,9 @@ def load_config(
         if not environ.get(provider.api_key_env):
             provider.available = False
             provider.unavailable_reason = f"环境变量 {provider.api_key_env} 未设置"
+            # 只记环境变量名，绝不记密钥值
+            logger.warning("provider %s 不可用：环境变量 %s 未设置",
+                           provider.name, provider.api_key_env)
         cfg.providers.append(provider)
 
     if not cfg.providers:

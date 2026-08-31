@@ -1,6 +1,7 @@
 """FastAPI 入口：本地 OpenAI 兼容端点。"""
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI, Request, Response
@@ -11,6 +12,8 @@ from .failover import Breaker
 from .forward import GatewayResponse, GatewayService
 from .ratelimit import TokenBucket
 from .stats import Stats
+
+logger = logging.getLogger("gateway")
 
 
 def _build_service(cfg: AppConfig) -> GatewayService:
@@ -81,6 +84,10 @@ def create_app(cfg: AppConfig | None = None, service: GatewayService | None = No
     async def stats() -> dict:
         return service.stats.snapshot()
 
+    # 启动摘要：只记 provider 名与可用性（不可用时为原因），不含任何密钥值
+    logger.info("网关启动：providers=%s",
+                [(p.name, "可用" if p.available else p.unavailable_reason)
+                 for p in cfg.providers])
     return app
 
 
