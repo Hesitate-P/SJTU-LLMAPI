@@ -1,3 +1,5 @@
+import pytest
+
 from app.ratelimit import TokenBucket
 
 
@@ -23,3 +25,13 @@ async def test_times_out_when_refill_too_slow():
     bucket = TokenBucket(rate_per_minute=6, burst=1)  # 0.1/秒
     assert await bucket.acquire(0) is True
     assert await bucket.acquire(0.05) is False
+
+
+def test_zero_rate_rejected():
+    with pytest.raises(ValueError):
+        TokenBucket(rate_per_minute=0)
+
+
+def test_negative_burst_rejected():
+    with pytest.raises(ValueError):
+        TokenBucket(rate_per_minute=9, burst=-1)

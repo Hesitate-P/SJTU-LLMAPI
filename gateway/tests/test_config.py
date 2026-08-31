@@ -71,3 +71,15 @@ def test_no_providers_rejected(tmp_path):
     path.write_text("providers: []\n", encoding="utf-8")
     with pytest.raises(ValueError, match="provider"):
         load_config(str(path), environ={}, resolver=RES)
+
+
+def test_zero_rate_limit_rejected(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "providers:\n  - name: p\n    base_url: https://a.test/v1\n"
+        "    api_key_env: X\n    priority: 1\n    models: [m]\n"
+        "    proactive_rate_limit:\n      requests_per_minute: 0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="requests_per_minute"):
+        load_config(str(path), environ={"X": "k"}, resolver=RES)

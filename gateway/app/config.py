@@ -84,10 +84,22 @@ def load_config(
         )
         rl = item.get("proactive_rate_limit")
         if rl:
+            requests_per_minute = int(rl["requests_per_minute"])
+            burst = int(rl.get("burst", 3))
+            if requests_per_minute <= 0:
+                raise ValueError(
+                    f"{path} 中 provider {provider.name} 的 proactive_rate_limit.requests_per_minute "
+                    f"必须为正数，收到 {requests_per_minute}"
+                )
+            if burst <= 0:
+                raise ValueError(
+                    f"{path} 中 provider {provider.name} 的 proactive_rate_limit.burst "
+                    f"必须为正数，收到 {burst}"
+                )
             provider.proactive_rate_limit = RateLimitConfig(
-                requests_per_minute=int(rl["requests_per_minute"]),
+                requests_per_minute=requests_per_minute,
                 max_wait_seconds=float(rl.get("max_wait_seconds", 2.0)),
-                burst=int(rl.get("burst", 3)),
+                burst=burst,
             )
         assert_safe_upstream_url(provider.base_url, resolver=resolver)
         if not environ.get(provider.api_key_env):

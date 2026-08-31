@@ -7,6 +7,10 @@ import time
 
 class TokenBucket:
     def __init__(self, rate_per_minute: float, burst: float = 3.0) -> None:
+        if rate_per_minute <= 0:
+            raise ValueError(f"rate_per_minute 必须为正数，收到 {rate_per_minute!r}")
+        if burst <= 0:
+            raise ValueError(f"burst 必须为正数，收到 {burst!r}")
         self._rate = rate_per_minute / 60.0  # 每秒补充
         self._burst = float(burst)
         self._tokens = float(burst)
