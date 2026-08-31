@@ -247,3 +247,78 @@ async def test_request_time_ssrf_all_violate_returns_502(monkeypatch):
     result = await service.chat({"model": "m1"})
     assert result.status_code == 502
     assert result.provider == "local"
+
+
+def tracking_service(handler, closes: list, cfg=None):
+    """用真实 httpx.AsyncClient 子类统计关闭调用（aclose 与 __aexit__ 都算，
+    验证行为而非 mock 内部）。"""
+
+    class TrackingClient(httpx.AsyncClient):
+        async def aclose(self) -> None:
+            closes.append(1)
+            await super().aclose()
+
+        async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+            closes.append(1)
+            await super().__aexit__(exc_type, exc_value, traceback)
+
+    cfg = cfg or make_cfg()
+    return GatewayService(
+        cfg, Breaker(), Stats(), {},
+        client_factory=lambda: TrackingClient(
+            transport=httpx.MockTransport(handler)),
+        resolver=lambda host: ["93.184.216.34"],
+    )
+
+
+async def test_stream_client_lives_until_stream_end(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    closes: list[int] = []
+    closed_while_consuming = []
+
+    async def gen():
+        yield b"data: one\n\n"
+        yield b"data: two\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content=gen())
+
+    service = tracking_service(handler, closes)
+    result = await service.chat({"model": "m1", "stream": True})
+    assert result.provider == "sjtu"
+    chunks = []
+    async for chunk in result.stream:
+        chunks.append(chunk)
+        closed_while_consuming.append(bool(closes))
+    assert chunks == [b"data: one\n\n", b"data: two\n\n"]
+    assert not any(closed_while_consuming)  # 消费期间客户端必须存活
+    assert closes == [1]  # 流结束后恰好关闭一次
+
+
+async def test_non_stream_client_closed_after_return(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    closes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    service = tracking_service(handler, closes)
+    result = await service.chat({"model": "m1"})
+    assert result.status_code == 200
+    assert closes == [1]  # chat() 返回后客户端已关闭且仅一次
+
+
+async def test_all_fail_client_closed_after_502(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "d")
+    closes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "no"})
+
+    service = tracking_service(handler, closes)
+    result = await service.chat({"model": "m1"})
+    assert result.status_code == 502
+    assert result.provider == "local"
+    assert closes == [1]  # 全部失败返回 502 后客户端已关闭且仅一次

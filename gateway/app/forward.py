@@ -1,6 +1,8 @@
 """转发引擎：候选链尝试 + 宽切换 + SSE 透传（首块前可安全重试）。"""
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 from collections.abc import AsyncIterator, Callable
@@ -22,6 +24,8 @@ class GatewayResponse:
     media_type: str
     provider: str
     body: bytes | None = None
+    # 流式响应体：消费方必须完整消费或关闭迭代器（Starlette 的
+    # StreamingResponse 会做），否则上游连接池泄漏。
     stream: AsyncIterator[bytes] | None = None
 
     @property
@@ -78,7 +82,11 @@ class GatewayService:
                 body=_openai_error(f"没有供应商提供模型 {model}",
                                    "invalid_request_error", "model_not_found"))
 
-        async with self._client_factory() as client:
+        # 手动持有 client：流式响应会把所有权移交给流生成器（由其最终关闭），
+        # 其余路径在 finally 统一关闭；循环内的 continue 天然复用同一 client。
+        client = self._client_factory()
+        handed_over = False
+        try:
             for provider, upstream_model in chain:
                 if self.breaker.is_open(provider.name):
                     continue
@@ -101,11 +109,17 @@ class GatewayService:
                 kind = classify_status(resp.status_code, resp.snippet)
                 self.stats.record(provider.name, kind)
                 if kind is ErrorKind.OK:
+                    if resp.stream is not None:
+                        # 流式响应：client 所有权移交给流生成器，由其关闭
+                        handed_over = True
                     return resp
                 if kind is ErrorKind.CLIENT:
                     return resp  # 请求问题：透传，不切换
                 self.breaker.record_failure(provider.name, kind)
                 self.stats.note_switched_away(provider.name)
+        finally:
+            if not handed_over:
+                await client.aclose()
 
         return GatewayResponse(
             502, "application/json", "local",
@@ -127,7 +141,7 @@ class GatewayService:
             "Content-Type": "application/json",
         }
         request = client.build_request("POST", url, json=payload, headers=headers)
-        assert_safe_upstream_url(url, resolver=self._resolver)
+        await asyncio.to_thread(assert_safe_upstream_url, url, resolver=self._resolver)
 
         if not payload.get("stream"):
             response = await client.send(request)
@@ -154,19 +168,30 @@ class GatewayService:
         try:
             first = await anext(chunks)
         except StopAsyncIteration:
-            await response.aclose()
+            # aclose 自身可能失败（连接已断），抑制之以免屏蔽原始异常；
+            # 此路径未移交所有权，client 由 chat() 的 finally 关闭
+            with contextlib.suppress(Exception):
+                await response.aclose()
             raise httpx.RemoteProtocolError("upstream closed before first chunk") from None
         except httpx.HTTPError:
-            await response.aclose()
+            with contextlib.suppress(Exception):
+                await response.aclose()
             raise
 
         async def stream() -> AsyncIterator[bytes]:
+            """SSE 响应体：消费方必须完整消费或关闭迭代器（Starlette 的
+            StreamingResponse 会做），否则上游连接池泄漏。
+            """
             try:
                 yield first
                 async for chunk in chunks:
                     yield chunk
             finally:
-                await response.aclose()
+                # aclose 自身可能失败（连接已断），抑制之以免屏蔽原始异常
+                with contextlib.suppress(Exception):
+                    await response.aclose()
+                with contextlib.suppress(Exception):
+                    await client.aclose()
 
         return GatewayResponse(
             200, response.headers.get("content-type", "text/event-stream"),
@@ -180,7 +205,8 @@ class GatewayService:
                     continue
                 try:
                     models_url = provider.base_url + "/models"
-                    assert_safe_upstream_url(models_url, resolver=self._resolver)
+                    await asyncio.to_thread(
+                        assert_safe_upstream_url, models_url, resolver=self._resolver)
                     response = await client.get(
                         models_url,
                         headers={"Authorization": f"Bearer {_provider_key(provider)}"},
