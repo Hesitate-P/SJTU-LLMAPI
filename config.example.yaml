@@ -1,0 +1,29 @@
+listen_host: 0.0.0.0        # 容器内必须 0.0.0.0；宿主机侧仅暴露 127.0.0.1
+listen_port: 8000
+providers:
+  - name: sjtu
+    base_url: https://models.sjtu.edu.cn/api/v1
+    api_key_env: SJTU_API_KEY
+    models: [deepseek-chat, deepseek-reasoner, minimax, minimax-m2.7, qwen, qwen3.6-27b]
+    priority: 1
+    proactive_rate_limit:
+      requests_per_minute: 9
+      max_wait_seconds: 2
+      burst: 3
+  - name: deepseek
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    models: [deepseek-chat, deepseek-reasoner]
+    priority: 2
+  # 更多 OpenAI 兼容上游按此格式追加；模型名不同时用 model_map 映射
+  # - name: other
+  #   base_url: https://example.com/v1
+  #   api_key_env: OTHER_API_KEY
+  #   model_map: { minimax: "上游实际模型名", qwen: "上游实际模型名" }
+  #   priority: 3
+failover:
+  cooldown_429_seconds: 60
+  cooldown_quota_seconds: 1800
+  cooldown_network_seconds: 15
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 600
