@@ -81,3 +81,24 @@ async def test_no_secrets_in_logs(monkeypatch, caplog):
         result = await make_service(handler).chat({"model": "m1"})
     assert result.status_code == 200
     assert "super-secret-key-123" not in caplog.text
+
+
+def test_root_logging_configured():
+    """main 模块导入时须 basicConfig root logger（uvicorn 只配自身，生产下 INFO 才有输出）。"""
+    import importlib
+
+    import app.main as main_mod
+
+    saved_handlers = logging.root.handlers[:]
+    saved_level = logging.root.level
+    try:
+        # pytest/logging 插件可能已给 root 挂 handler，basicConfig 会 no-op；
+        # 清空后 reload 才能确定性地验证模块导入行为。
+        logging.root.handlers.clear()
+        importlib.reload(main_mod)
+        assert logging.getLogger("gateway").isEnabledFor(logging.INFO)
+        assert logging.root.level == logging.INFO
+        assert logging.root.handlers, "basicConfig 应为 root logger 挂上 handler"
+    finally:
+        logging.root.handlers[:] = saved_handlers
+        logging.root.setLevel(saved_level)

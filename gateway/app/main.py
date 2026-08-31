@@ -13,6 +13,9 @@ from .forward import GatewayResponse, GatewayService
 from .ratelimit import TokenBucket
 from .stats import Stats
 
+# uvicorn 只配置自身 logger，root logger 无 handler 时 gateway 的 INFO 日志在生产部署下不会输出。
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
 logger = logging.getLogger("gateway")
 
 
