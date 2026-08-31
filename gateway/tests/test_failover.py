@@ -51,3 +51,10 @@ def test_remaining():
     breaker = Breaker(cooldown_429=60.0)
     breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT, now=100.0)
     assert breaker.cooldown_remaining("sjtu", now=130.0) == pytest.approx(30.0)
+
+
+def test_short_cooldown_inside_long_window_returns_effective_deadline():
+    breaker = Breaker()
+    assert breaker.record_failure("p", ErrorKind.QUOTA, now=100.0) == 1900.0
+    assert breaker.record_failure("p", ErrorKind.RATE_LIMIT, now=200.0) == 1900.0  # 不是 260.0
+    assert breaker.cooldown_remaining("p", now=200.0) == 1700.0

@@ -62,4 +62,4 @@ class Breaker:
         until = self._now(now) + cooldown
         if until > self._until.get(provider, 0.0):
             self._until[provider] = until
-        return until
+        return max(until, self._until.get(provider, 0.0))
