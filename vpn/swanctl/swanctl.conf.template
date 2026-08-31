@@ -1,0 +1,34 @@
+connections {
+    sjtu {
+        local_addrs  = %defaultroute
+        remote_addrs = ${VPN_SERVER}
+        version = 2
+        # 学校网关提案未知，spike 时按需收窄/调整
+        proposals = aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp1024,default
+        send_cert = never
+        fragmentation = yes
+        mobike = yes
+        local {
+            auth = eap-mschapv2
+            eap_id = ${VPN_USERNAME}
+        }
+        remote {
+            auth = pubkey
+        }
+        children {
+            sjtu {
+                # 关键：流量选择器只圈定交大网段，不做默认路由接管
+                remote_ts = ${VPN_TS}
+                start_action = none
+                dpd_action = restart
+                close_action = restart
+            }
+        }
+    }
+}
+secrets {
+    eap-sjtu {
+        id = ${VPN_USERNAME}
+        secret = ${VPN_PASSWORD}
+    }
+}
