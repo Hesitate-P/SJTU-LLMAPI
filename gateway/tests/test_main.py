@@ -84,6 +84,20 @@ def test_stats_endpoint(monkeypatch):
     assert snap["sjtu"]["success"] == 1
 
 
+def test_health_accessible_without_key(monkeypatch):
+    client = make_client(monkeypatch, gateway_key="secret")
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_stats_still_requires_key(monkeypatch):
+    client = make_client(monkeypatch, gateway_key="secret")
+    assert client.get("/stats").status_code == 401
+    ok = client.get("/stats", headers={"Authorization": "Bearer secret"})
+    assert ok.status_code == 200
+
+
 def test_health_endpoint(monkeypatch):
     client = make_client(monkeypatch)
     body = client.get("/health").json()

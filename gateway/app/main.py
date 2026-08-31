@@ -36,6 +36,9 @@ def create_app(cfg: AppConfig | None = None, service: GatewayService | None = No
 
     @app.middleware("http")
     async def require_gateway_key(request: Request, call_next):
+        # /health 供运维探针免鉴权访问；仅暴露可用性状态
+        if request.url.path == "/health":
+            return await call_next(request)
         expected = os.environ.get("GATEWAY_API_KEY")
         if expected:
             supplied = request.headers.get("authorization", "")
