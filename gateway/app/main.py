@@ -36,7 +36,7 @@ def _build_service(cfg: AppConfig) -> GatewayService:
 
 
 def create_app(cfg: AppConfig | None = None, service: GatewayService | None = None) -> FastAPI:
-    cfg = cfg or load_config(os.environ.get("GATEWAY_CONFIG", "config.yaml"))
+    cfg = cfg or load_config("config.yaml")
     service = service or _build_service(cfg)
     app = FastAPI(title="sjtu-llm-gateway")
 
@@ -94,8 +94,9 @@ def create_app(cfg: AppConfig | None = None, service: GatewayService | None = No
     return app
 
 
-_config_path = os.environ.get("GATEWAY_CONFIG", "config.yaml")
-if os.path.exists(_config_path):
+# 配置固定从工作目录加载（容器 WORKDIR=/app 下即挂载的 /app/config.yaml）；
+# 不提供路径环境变量，避免 env→文件读取的污点面
+if os.path.exists("config.yaml"):
     app = create_app()  # 生产/容器：config.yaml 已挂载
 else:
     app = None  # 本地开发未提供配置时允许导入（测试显式传 cfg）；uvicorn 启动需先备好配置
@@ -106,5 +107,5 @@ if __name__ == "__main__":
     # （容器内仍走 Dockerfile CMD，不受影响）
     import uvicorn
 
-    cfg = load_config(_config_path)
+    cfg = load_config("config.yaml")
     uvicorn.run(app or create_app(cfg), host=cfg.listen_host, port=cfg.listen_port)

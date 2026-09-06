@@ -52,10 +52,7 @@ class AppConfig:
 
 
 def _resolve_config_path(path: str) -> str:
-    """配置路径白名单：只允许工作目录、/app 或系统临时目录内的文件。
-
-    GATEWAY_CONFIG 是运维注入的环境变量，仍约束其落点，防止被改成任意路径读取。
-    """
+    """配置路径白名单：只允许工作目录、/app 或系统临时目录内的文件（纵深防御）。"""
     resolved = os.path.realpath(path)
     roots = [os.path.realpath(os.getcwd()), "/app", tempfile.gettempdir()]
     if not any(resolved == root or resolved.startswith(root + os.sep) for root in roots):

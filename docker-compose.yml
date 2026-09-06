@@ -26,8 +26,6 @@ services:
     build: ./gateway
     network_mode: "service:vpn"
     env_file: .env
-    environment:
-      GATEWAY_CONFIG: /app/config.yaml
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped

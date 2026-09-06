@@ -5,7 +5,7 @@
 - 设计文档：`docs/superpowers/specs/2026-08-31-sjtu-llm-gateway-design.md`
 - 实现计划：`docs/superpowers/plans/2026-08-31-sjtu-llm-gateway.md`
 - VPN spike 结论：`docs/superpowers/notes/2026-08-31-vpn-spike.md`
-- 参数/速率实测脚本：`scripts/probe_sjtu.py`、`scripts/probe_openai_params.py`（**本地诊断工具，不入库**——需自备，从环境变量读凭据）
+- 参数/速率实测脚本：`~/sjtu-probes/probe_*.py`（**本地诊断工具，不入库不入扫描范围**——从环境变量读凭据）
 
 ---
 
