@@ -1,0 +1,3 @@
+# 统一文本文件行尾为 LF：Windows 侧检出若转成 CRLF，vpn/entrypoint.sh 的 shebang
+# 会带上 \r，容器启动即炸 "exec /entrypoint.sh: no such file or directory"。
+* text=auto eol=lf
