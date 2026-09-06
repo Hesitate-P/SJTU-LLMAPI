@@ -83,3 +83,15 @@ def test_zero_rate_limit_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="requests_per_minute"):
         load_config(str(path), environ={"X": "k"}, resolver=RES)
+
+
+def test_config_path_outside_allowed_roots_rejected():
+    with pytest.raises(ValueError, match="越界"):
+        load_config("/root/evil.yaml", environ={}, resolver=RES)
+
+
+def test_config_path_inside_tmp_allowed(tmp_path):
+    path = tmp_path / "ok.yaml"
+    path.write_text(YAML, encoding="utf-8")
+    cfg = load_config(str(path), environ={"SJTU_API_KEY": "k", "DEEPSEEK_API_KEY": "k"}, resolver=RES)
+    assert cfg.providers

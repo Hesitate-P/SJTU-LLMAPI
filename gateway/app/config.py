@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -50,13 +51,27 @@ class AppConfig:
     failover: FailoverConfig = field(default_factory=FailoverConfig)
 
 
+def _resolve_config_path(path: str) -> str:
+    """配置路径白名单：只允许工作目录、/app 或系统临时目录内的文件。
+
+    GATEWAY_CONFIG 是运维注入的环境变量，仍约束其落点，防止被改成任意路径读取。
+    """
+    resolved = os.path.realpath(path)
+    roots = [os.path.realpath(os.getcwd()), "/app", tempfile.gettempdir()]
+    if not any(resolved == root or resolved.startswith(root + os.sep) for root in roots):
+        raise ValueError(
+            f"配置路径越界：{path!r}（解析为 {resolved}），只允许工作目录、/app 或系统临时目录内"
+        )
+    return resolved
+
+
 def load_config(
     path: str,
     environ: Mapping[str, str] | None = None,
     resolver=None,
 ) -> AppConfig:
     environ = os.environ if environ is None else environ
-    with open(path, encoding="utf-8") as fh:
+    with open(_resolve_config_path(path), encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
 
     cfg = AppConfig(
