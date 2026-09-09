@@ -4,7 +4,7 @@ providers:
   - name: sjtu
     base_url: https://models.sjtu.edu.cn/api/v1
     api_key_env: SJTU_API_KEY
-    models: [deepseek-chat, deepseek-reasoner, minimax, minimax-m2.7, qwen, qwen3.6-27b]
+    models: [deepseek-chat, deepseek-reasoner, qwen]
     priority: 1
     proactive_rate_limit:
       requests_per_minute: 9
@@ -13,9 +13,9 @@ providers:
   - name: deepseek
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
-    models: [deepseek-chat, deepseek-reasoner]
+    model_map: { deepseek-chat: "deepseek-v4-flash", deepseek-reasoner: "deepseek-v4-flash", qwen: "deepseek-v4-flash-vision-exp"}
     priority: 2
-    context_window: 131072      # 官方 128K；不配会被裸模型名层兜成 262144（交大实测值），导致误路由与告警失效
+    context_window: 262144
   # 更多 OpenAI 兼容上游按此格式追加；模型名不同时用 model_map 映射
   # - name: other
   #   base_url: https://example.com/v1
