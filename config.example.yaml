@@ -15,6 +15,7 @@ providers:
     api_key_env: DEEPSEEK_API_KEY
     models: [deepseek-chat, deepseek-reasoner]
     priority: 2
+    context_window: 131072      # 官方 128K；不配会被裸模型名层兜成 262144（交大实测值），导致误路由与告警失效
   # 更多 OpenAI 兼容上游按此格式追加；模型名不同时用 model_map 映射
   # - name: other
   #   base_url: https://example.com/v1
