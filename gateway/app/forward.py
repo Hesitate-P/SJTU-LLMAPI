@@ -15,7 +15,7 @@ import httpx
 from .config import AppConfig, ProviderConfig, context_for
 from .estimate import estimate_request_tokens
 from .failover import Breaker, ErrorKind, classify_status
-from .normalize import normalize_response
+from .normalize import StreamNormalizer, normalize_response
 from .providers import build_chain
 from .ratelimit import TokenBucket
 from .security import assert_safe_upstream_url
@@ -290,14 +290,26 @@ class GatewayService:
                 await response.aclose()
             raise
 
+        # FR13 流式归一器：首块取得（提交边界）之后创建——归一只作用于已提交
+        # 的流，不影响首块前的故障切换；坏 JSON/编码失败一律原样透出（降级）。
+        normalizer = StreamNormalizer(request_body["model"])
+
         async def stream() -> AsyncIterator[bytes]:
             """SSE 响应体：消费方必须完整消费或关闭迭代器（Starlette 的
             StreamingResponse 会做），否则上游连接池泄漏。
+            逐 chunk 过 StreamNormalizer（行组装 + model 回写 + think 改投）。
             """
             try:
-                yield first
+                head = normalizer.feed_bytes(first)
+                if head:
+                    yield head
                 async for chunk in chunks:
-                    yield chunk
+                    out = normalizer.feed_bytes(chunk)
+                    if out:
+                        yield out
+                tail = normalizer.finish_bytes()
+                if tail:
+                    yield tail
             except Exception as exc:
                 # 流中死亡（GeneratorExit 属 BaseException，不会进此分支）：
                 # 记熔断与统计后再透传，避免死供应商仍居最高优先
