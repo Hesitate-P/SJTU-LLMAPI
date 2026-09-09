@@ -446,3 +446,70 @@ async def test_all_fail_client_closed_after_502(monkeypatch):
     assert result.status_code == 502
     assert result.provider == "local"
     assert closes == [1]  # 全部失败返回 502 后客户端已关闭且仅一次
+
+
+def context_cfg():
+    """deepseek 显式 131072（yaml 的 context_window 语义）；sjtu 不配置走内置 262144。"""
+    return AppConfig(providers=[
+        ProviderConfig(name="sjtu", base_url="https://sjtu.test/v1", api_key_env="SJTU_API_KEY",
+                       priority=1, models=["deepseek-chat"]),
+        ProviderConfig(name="deepseek", base_url="https://deepseek.test/v1",
+                       api_key_env="DEEPSEEK_API_KEY", priority=2, models=["deepseek-chat"],
+                       context_window=131072),
+    ])
+
+
+async def test_context_filtered_to_capable_provider(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "d")
+    calls = []
+    # "a"*520000 → 520000*0.25*1.1+4 ≈ 143004 tokens：>131072 剔除 deepseek、<262144 保留 sjtu
+    big = {"model": "deepseek-chat",
+           "messages": [{"role": "user", "content": "a" * 520000}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        if request.url.host == "deepseek.test":
+            raise AssertionError("窗口不足的供应商不应被请求")
+        return httpx.Response(200, json={"id": "x", "choices": []})
+
+    result = await make_service(handler, context_cfg()).chat(big)
+    assert result.provider == "sjtu"  # 正常由吃得下的 sjtu 服务
+    assert result.status_code == 200
+    assert result.context_limit == 262144  # 实际服务者窗口（sjtu 内置）
+    assert calls == ["sjtu.test"]  # deepseek 被窗口剔除，未被打
+
+    # sjtu 熔断：deepseek 仍不接盘（物理装不下，过滤先于熔断/探测），
+    # 链只剩 sjtu 且被熔断跳过 → 既有 502 而非打上游吃裸 400
+    calls.clear()
+    breaker = Breaker()
+    breaker.record_failure("sjtu", ErrorKind.RATE_LIMIT)
+    result = await explicit_service(handler, breaker, Stats(), context_cfg()).chat(big)
+    assert result.status_code == 502
+    assert result.provider == "local"
+    assert calls == []  # 既不打熔断中的 sjtu，也不打窗口不足的 deepseek
+
+
+async def test_all_too_large_returns_413(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "d")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        raise AssertionError("全超窗请求不应打任何上游")
+
+    # "a"*1200000 → ≈330004 tokens：超过 sjtu 262144 与 deepseek 131072 → 全剔除
+    huge = {"model": "deepseek-chat",
+            "messages": [{"role": "user", "content": "a" * 1200000}]}
+    result = await make_service(handler, context_cfg()).chat(huge)
+    assert result.status_code == 413
+    assert result.provider == "local"
+    assert result.context_limit is None
+    err = json.loads(result.body)["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "context_length_exceeded"
+    assert "330004" in err["message"]  # message 含估算值
+    assert "sjtu=262144" in err["message"]  # 与候选链全部供应商的窗口清单
+    assert "deepseek=131072" in err["message"]
+    assert calls == []

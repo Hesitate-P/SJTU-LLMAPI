@@ -12,7 +12,8 @@ from dataclasses import dataclass
 
 import httpx
 
-from .config import AppConfig, ProviderConfig
+from .config import AppConfig, ProviderConfig, context_for
+from .estimate import estimate_request_tokens
 from .failover import Breaker, ErrorKind, classify_status
 from .providers import build_chain
 from .ratelimit import TokenBucket
@@ -38,6 +39,9 @@ class GatewayResponse:
     # 流式响应体：消费方必须完整消费或关闭迭代器（Starlette 的
     # StreamingResponse 会做），否则上游连接池泄漏。
     stream: AsyncIterator[bytes] | None = None
+    # FR11 成功路径（OK 返回时）设置：实际服务者对该（客户端可见）模型的
+    # 上下文窗口，由 main 注入 X-Gateway-Context-Limit 头；其余路径保持 None。
+    context_limit: int | None = None
 
     @property
     def snippet(self) -> str:
@@ -124,12 +128,38 @@ class GatewayService:
             self._log_chat(model, chain_repr, result, trace, start)
             return result
 
+        # FR11 请求时上下文过滤：估算装不下的供应商直接剔除（窗口按客户端
+        # 模型名解析，各家对同一逻辑模型窗口一致）。剔除先于熔断/限速检查——
+        # 物理不可能的供应商不占半开探测与令牌桶。全剔除 → 本地 413，
+        # 不打任何上游（既有"链耗尽 → 502"只覆盖熔断/软饱和耗尽）。
+        need = estimate_request_tokens(request_body)
+        capable: list[tuple[ProviderConfig, str]] = []
+        for provider, upstream_model in chain:
+            window = context_for(provider, model)
+            if need > window:
+                trace.append((provider.name, "context_too_large"))
+                logger.info("provider %s 因上下文窗口不足被剔除：估算 %d > 窗口 %d",
+                            provider.name, need, window)
+                continue
+            capable.append((provider, upstream_model))
+        if not capable:
+            windows_repr = ", ".join(
+                f"{p.name}={context_for(p, model)}" for p, _ in chain)
+            result = GatewayResponse(
+                413, "application/json", "local",
+                body=_openai_error(
+                    f"请求估算 {need} tokens 超过所有候选供应商的上下文窗口：{windows_repr}",
+                    "invalid_request_error", "context_length_exceeded"),
+                context_limit=None)
+            self._log_chat(model, chain_repr, result, trace, start)
+            return result
+
         # 手动持有 client：流式响应会把所有权移交给流生成器（由其最终关闭），
         # 其余路径在 finally 统一关闭；循环内的 continue 天然复用同一 client。
         client = self._client_factory()
         handed_over = False
         try:
-            for provider, upstream_model in chain:
+            for provider, upstream_model in capable:
                 if not self.breaker.acquire_probe(provider.name):
                     # 熔断/半开准入失败：本轮未尝试该供应商，无本请求内的原因，不入 trace
                     continue
@@ -161,6 +191,7 @@ class GatewayService:
                     self.stats.record(provider.name, kind)
                     if kind is ErrorKind.OK:
                         self.breaker.record_success(provider.name)  # 能应答即活着（半开探测成功）
+                        resp.context_limit = context_for(provider, model)  # 披露实际服务者窗口
                         if resp.stream is not None:
                             # 流式响应：client 所有权移交给流生成器，由其关闭
                             handed_over = True
