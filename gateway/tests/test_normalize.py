@@ -121,6 +121,54 @@ async def test_forward_non_stream_normalizes_minimax_style(monkeypatch):
     assert msg["reasoning_content"] == "思考过程"
 
 
+async def test_forward_multi_choice_think_and_usage_survive(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "cmpl-2", "model": "minimax-upstream-name",
+            "choices": [
+                {"index": 0, "message": {"role": "assistant",
+                                         "content": "<think>思路甲</think>答案甲"}},
+                {"index": 1, "message": {"role": "assistant",
+                                         "content": "<think>思路乙</think>答案乙"}},
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 7,
+                      "total_tokens": 17}})
+
+    result = await minimax_service(handler).chat(
+        {"model": "minimax", "messages": [{"role": "user", "content": "hi"}]})
+    assert result.status_code == 200
+    body = json.loads(result.body)
+    assert body["model"] == "minimax"
+    # usage 等无关字段往返保真
+    assert body["usage"] == {"prompt_tokens": 10, "completion_tokens": 7,
+                             "total_tokens": 17}
+    # 两个 choices 的 think 前缀都被剥离
+    first, second = body["choices"]
+    assert first["message"]["content"] == "答案甲"
+    assert first["message"]["reasoning_content"] == "思路甲"
+    assert second["message"]["content"] == "答案乙"
+    assert second["message"]["reasoning_content"] == "思路乙"
+
+
+async def test_forward_lone_surrogate_degrades_to_original_bytes(monkeypatch):
+    monkeypatch.setenv("SJTU_API_KEY", "s")
+    # JSON 转义 "\\ud800"：json.loads 能解析出未配对代理，但
+    # ensure_ascii=False 的 dumps→encode 会抛 UnicodeEncodeError——
+    # 归一必须降级返回原始 bytes，绝不把成功响应变成异常
+    raw = b'{"model":"up","choices":[{"message":{"content":"\\ud800ok"}}]}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw,
+                              headers={"content-type": "application/json"})
+
+    result = await minimax_service(handler).chat(
+        {"model": "minimax", "messages": [{"role": "user", "content": "hi"}]})
+    assert result.status_code == 200
+    assert result.body == raw  # 序列化失败降级：原样 bytes，未抛异常
+
+
 async def test_forward_client_error_not_normalized(monkeypatch):
     monkeypatch.setenv("SJTU_API_KEY", "s")
 

@@ -61,15 +61,16 @@ def _provider_key(provider: ProviderConfig) -> str:
 
 def _normalize_non_stream(body: bytes, client_model: str) -> bytes:
     """FR12 非流式 OK 响应归一：model 回写 + <think> 剥离后重序列化
-    （ensure_ascii=False 保中文原貌）。解析失败或非 dict → 原样 bytes
-    返回（降级，绝不抛）。"""
+    （ensure_ascii=False 保中文原貌）。解析失败、非 dict 或重序列化失败
+    （如上游 body 含未配对代理码点 U+D800，UTF-8 encode 抛错）→ 原样返回
+    原始 bytes 对象（降级，绝不抛——归一失败不能把成功响应变成 500）。"""
     try:
         j = json.loads(body)
-    except ValueError:  # JSONDecodeError / UnicodeDecodeError 都是 ValueError 子类
+        if not isinstance(j, dict):
+            return body
+        return json.dumps(normalize_response(j, client_model), ensure_ascii=False).encode()
+    except Exception:  # noqa: BLE001 —— 归一绝不向上抛
         return body
-    if not isinstance(j, dict):
-        return body
-    return json.dumps(normalize_response(j, client_model), ensure_ascii=False).encode()
 
 
 class GatewayService:
