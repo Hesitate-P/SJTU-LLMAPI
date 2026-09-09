@@ -331,37 +331,3 @@ class GatewayService:
             200, response.headers.get("content-type", "text/event-stream"),
             provider.name, stream=stream(),
         )
-
-    async def list_models(self) -> GatewayResponse:
-        async with self._client_factory() as client:
-            for provider in self.cfg.providers:
-                if not provider.available or self.breaker.is_open(provider.name):
-                    continue
-                try:
-                    models_url = provider.base_url + "/models"
-                    await asyncio.to_thread(
-                        assert_safe_upstream_url, models_url, resolver=self._resolver)
-                    response = await client.get(
-                        models_url,
-                        headers={"Authorization": f"Bearer {_provider_key(provider)}"},
-                    )
-                except (httpx.HTTPError, ValueError):
-                    # SSRF 校验失败或网络故障：切换下一家
-                    continue
-                if response.status_code == 200:
-                    return GatewayResponse(
-                        200,
-                        response.headers.get("content-type", "application/json"),
-                        provider.name,
-                        body=response.content,
-                    )
-        ids = sorted({
-            m
-            for p in self.cfg.providers if p.available
-            for m in [*p.models, *p.model_map]
-        })
-        body = json.dumps({
-            "object": "list",
-            "data": [{"id": m, "object": "model", "owned_by": "gateway"} for m in ids],
-        }).encode()
-        return GatewayResponse(200, "application/json", "config", body=body)

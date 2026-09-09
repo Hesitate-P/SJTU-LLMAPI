@@ -1,13 +1,14 @@
 """FastAPI 入口：本地 OpenAI 兼容端点。"""
 from __future__ import annotations
 
+import json
 import logging
 import os
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .config import AppConfig, load_config
+from .config import AppConfig, ProviderConfig, context_for, load_config
 from .failover import Breaker
 from .forward import GatewayResponse, GatewayService
 from .ratelimit import TokenBucket
@@ -56,6 +57,9 @@ def create_app(cfg: AppConfig | None = None, service: GatewayService | None = No
 
     def _to_response(result: GatewayResponse) -> Response:
         headers = {"X-Gateway-Provider": result.provider}
+        if result.context_limit is not None:
+            # FR11：成功路径披露实际服务者对该（客户端可见）模型的上下文窗口
+            headers["X-Gateway-Context-Limit"] = str(result.context_limit)
         if result.stream is not None:
             return StreamingResponse(result.stream, status_code=result.status_code,
                                      media_type=result.media_type, headers=headers)
@@ -69,7 +73,22 @@ def create_app(cfg: AppConfig | None = None, service: GatewayService | None = No
 
     @app.get("/v1/models")
     async def models() -> Response:
-        return _to_response(await service.list_models())
+        # v2 目录聚合：不打上游 /models。遍历全部已配置供应商（不论 available，
+        # 目录反映配置而非实时健康），取 models + model_map 客户端可见键并集；
+        # context_window 由最优先（priority 最小）可服务该模型的供应商解析，
+        # 与 chat 的实际路由窗口语义一致。
+        primary: dict[str, ProviderConfig] = {}
+        for provider in sorted(cfg.providers, key=lambda p: p.priority):
+            for model in (*provider.models, *provider.model_map):
+                primary.setdefault(model, provider)
+        data = [
+            {"id": model, "object": "model", "owned_by": "gateway",
+             "context_window": context_for(primary[model], model)}
+            for model in sorted(primary)
+        ]
+        body = json.dumps({"object": "list", "data": data}).encode()
+        return Response(content=body, status_code=200, media_type="application/json",
+                        headers={"X-Gateway-Provider": "config"})
 
     @app.get("/health")
     async def health() -> dict:
