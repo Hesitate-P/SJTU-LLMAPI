@@ -69,9 +69,9 @@ resp = client.chat.completions.create(model="deepseek-chat",
 | `stream` | bool | `true` 时 SSE 透传，见下 |
 | 其余参数 | — | `temperature`、`tools`、`response_format`、`stop`、`n`、`max_tokens` 等全部透传，上游支持度见 §6.2 |
 
-**非流式响应**：上游原样响应 + 响应头 `X-Gateway-Provider: <实际服务者>`。
+**非流式响应**：上游响应（经 v2 归一，见 §6 开头）+ 响应头 `X-Gateway-Provider: <实际服务者>`；成功时另带 `X-Gateway-Context-Limit: <服务者对该模型的上下文窗口>`。
 
-**流式响应**：`text/event-stream`，逐块透传，结尾 `data: [DONE]`；`stream_options.include_usage` 可用。响应头同样带 `X-Gateway-Provider`。
+**流式响应**：`text/event-stream`，逐块透传，结尾 `data: [DONE]`；`stream_options.include_usage` 可用。响应头同样带 `X-Gateway-Provider`；成功时同样带 `X-Gateway-Context-Limit`。
 
 **故障切换语义**（对客户端透明）：
 
@@ -83,13 +83,14 @@ resp = client.chat.completions.create(model="deepseek-chat",
 | 4xx（请求本身问题） | 原样透传，不切换 |
 | 流式已开始（首块已发出）后中断 | 不重试（避免重复输出），透传错误并将该供应商熔断 15s |
 | 主动限速排队 > 2s（仅配置了限速的供应商，默认交大 9 次/分） | 软饱和跳过，直接下一候选 |
+| 请求估算 token 超过候选上下文窗口 | 窗口不足的候选被剔除（不打该上游、不占熔断/令牌额度）；全部候选都装不下 → 本地 413 `context_length_exceeded`（零上游调用） |
 | 全部候选耗尽 | 本地 502，见错误表 |
 
 熔断到期真半开恢复（冷却到期先只放一个探测请求，应答成功才全量恢复）；交大永远第一优先级（省钱优先）。
 
 ### 4.2 `GET /v1/models`
 
-返回候选链中首个可用供应商的实时模型列表（透传上游 `/models`）；全部不可用时回退为配置文件静态清单（`X-Gateway-Provider: config`）。
+返回配置目录聚合：遍历全部已配置供应商（不论实时可用性——目录反映配置而非健康），取 `models` 与 `model_map` 客户端可见键的并集排序。每项含 `context_window`，取最优先（`priority` 最小）可服务该模型的供应商的窗口解析值（解析顺序：`model_contexts` → `context_window` → 内置表 → 8192，见 §5.1），与 chat 实际路由语义一致。响应头 `X-Gateway-Provider: config`；**不请求上游 `/models`**。
 
 ### 4.3 `GET /health`（免鉴权）
 
@@ -111,9 +112,10 @@ resp = client.chat.completions.create(model="deepseek-chat",
 | 400 | `invalid_request_error` | 请求体缺 `model` 字段 / JSON 解析失败 |
 | 401 | `invalid_request_error` | 网关密钥缺失或错误 |
 | 404 | `model_not_found` | 模型名不在任何供应商清单 |
+| 413 | `context_length_exceeded` | 请求估算 token 超过所有候选供应商的上下文窗口（零上游调用，message 附各家窗口清单） |
 | 502 | `all_providers_failed` | 候选链全部不可用（熔断/网络/软饱和） |
 
-所有响应（含错误）均带 `X-Gateway-Provider` 头：`sjtu`/`deepseek`/…/`local`（本地生成）/`config`（静态回退）。
+所有响应（含错误）均带 `X-Gateway-Provider` 头：`sjtu`/`deepseek`/…/`local`（本地生成）/`config`（`/v1/models` 目录聚合）。成功路径（含流式）另带 `X-Gateway-Context-Limit` 头披露实际服务者对该模型的上下文窗口。
 
 ## 5. 配置参考
 
@@ -137,6 +139,9 @@ providers:
     api_key_env: DEEPSEEK_API_KEY
     models: [deepseek-chat, deepseek-reasoner]
     priority: 2
+    context_window: 131072          # 可选：该供应商的上下文窗口（DeepSeek 官方 128K）
+                                     # 不配则按客户端可见模型名查内置表（交大实测值），未命中按 8192
+    # model_contexts: { minimax: 200000 }  # 可选：按模型精细覆盖，优先于 context_window
   # 任意 OpenAI 兼容上游按此格式追加；模型名不同时用 model_map 映射：
   # - name: other
   #   base_url: https://example.com/v1
@@ -166,6 +171,8 @@ failover:
 | `VPN_EXTRA_HOSTS`（默认 `models.sjtu.edu.cn`） | 额外按域名解析并入隧道的 /32 |
 
 ## 6. 上游交大 API 实测参考（2026-08-31 实测）
+
+**网关 v2 归一行为**：上游响应的 `model` 字段一律回写为客户端请求的模型名；minimax 系回复内嵌的 `<think>…</think>` 前缀改投 `reasoning_content`（闭合后的正文回到 `content`），流式增量与非流式同样适用——客户端无需感知各家上游差异。
 
 ### 6.1 模型
 
@@ -203,7 +210,7 @@ docker compose logs -f gateway   # 结构化日志：model=/chain=/provider=/sta
 docker compose logs -f vpn       # 隧道协商/保活/路由
 curl -s http://127.0.0.1:8000/health
 curl -s -H "Authorization: Bearer $GATEWAY_API_KEY" http://127.0.0.1:8000/stats
-cd gateway && uv run pytest      # 85 个测试
+cd gateway && uv run pytest      # 146 个测试
 ```
 
 **排障**：
