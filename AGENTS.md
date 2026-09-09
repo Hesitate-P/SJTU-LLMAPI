@@ -25,12 +25,13 @@ Reference files:
 - The API key is **masked** in the notification files; the real key lives with the user. Never hardcode a key — read it from an environment variable (e.g., `SJTU_API_KEY`) or an untracked secrets file. Never print or echo key values into files, logs, or this AGENTS.md.
 - Files use Chinese names; keep filenames and content UTF-8 safe in any tooling.
 
-## 项目：sjtu-llm-gateway（本地 LLM API 转发网关）
+## 项目：sjtu-llm-gateway（本地 LLM 聚合网关）
 
-OpenAI 兼容本地网关（`gateway/`，Python 3.13 + FastAPI）+ 应用内 strongSwan IKEv2 隧道容器（`vpn/`）+ Compose 编排（共享网络命名空间，宿主仅 `127.0.0.1:8000`）。交大 API 优先，429/配额/5xx/网络错误自动切换到可配置的备用供应商（`config.yaml`）。
+OpenAI 兼容本地**聚合**网关（`gateway/`，Python 3.13 + FastAPI）+ 应用内 strongSwan IKEv2 隧道容器（`vpn/`）+ Compose 编排（共享网络命名空间，宿主仅 `127.0.0.1:8000`）。交大 API 优先；上下文窗口感知路由（413 保护）；429/配额/5xx/网络错误自动切换到可配置备用供应商；响应协议归一（model 回写、`<think>`→`reasoning_content`，流式含状态机）；`/v1/models` 聚合目录。
 
-- 设计文档：`docs/superpowers/specs/2026-08-31-sjtu-llm-gateway-design.md`；实现计划：`docs/superpowers/plans/2026-08-31-sjtu-llm-gateway.md`
-- 网关测试：`cd gateway && uv run pytest`
-- 全栈启动：`cp .env.example .env && cp config.example.yaml config.yaml`（填密钥）→ `docker compose up -d`；排障 `docker compose logs -f vpn gateway`；`curl http://127.0.0.1:8000/health`（免鉴权）
-- **验收状态**：Task 13（真实 IKEv2 spike，已通过，见 `docs/superpowers/notes/2026-08-31-vpn-spike.md`）与 Task 14（端到端验收，已通过：非流式/流式/限速切换/日志脱敏/Anthropic 入口 404 全达标）均完成；根日志 `logging.basicConfig` 修复已落在 `gateway/app/main.py`（生产部署下 gateway 的 INFO 请求日志可输出）
-- 已知合并后积压项：见 `.superpowers/sdd/2026-08-31-sjtu-llm-gateway/progress.md` 的 minor triage（若该目录已删，见 git 历史最终审查条目）
+- **完整文档：`docs/API.md`**（架构/端点/聚合语义/故障切换/配置/上游实测/运维/测试）
+- 设计：v1 `docs/superpowers/specs/2026-08-31-sjtu-llm-gateway-design.md`、v2 聚合层 `2026-09-06-aggregation-layer-design.md`
+- 网关测试：`cd gateway && uv run pytest`（146 个）
+- 全栈：`cp .env.example .env && cp config.example.yaml config.yaml`（填密钥）→ `docker compose up -d --build`（**代码更新必须 --build**）；排障 `docker compose logs -f vpn gateway`；`curl http://127.0.0.1:8000/health`（免鉴权）
+- 验收：v1 端到端（2026-08-31）与 v2 真实端到端 20/20（2026-09-09，上下文路由/归一/聚合全达标）均通过；mimosa 深扫 0 findings
+- 本地诊断脚本在 `~/sjtu-probes/`（live_v2_test.py / probe_sjtu.py / probe_openai_params.py，凭据从环境变量读，不入库）

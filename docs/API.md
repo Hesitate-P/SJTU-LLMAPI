@@ -1,26 +1,46 @@
-# SJTU LLM Gateway — API 文档
+# SJTU LLM Gateway — 完整文档
 
-本地 OpenAI 兼容 LLM 转发网关。交大校内 LLM API 经应用内 IKEv2 隧道优先服务；限额、限速或故障时自动切换到可配置的备用供应商（如 DeepSeek 官方）。
+本地 OpenAI 兼容 LLM **聚合网关**：交大校内 LLM API 经应用内 IKEv2 隧道优先服务，按上下文窗口智能路由，限额/限速/故障时自动切换到可配置的备用供应商，并将所有上游归一为**一个完整的 OpenAI 端点**。
 
-- 设计文档：`docs/superpowers/specs/2026-08-31-sjtu-llm-gateway-design.md`
-- 实现计划：`docs/superpowers/plans/2026-08-31-sjtu-llm-gateway.md`
-- VPN spike 结论：`docs/superpowers/notes/2026-08-31-vpn-spike.md`
-- 参数/速率实测脚本：`~/sjtu-probes/probe_*.py`（**本地诊断工具，不入库不入扫描范围**——从环境变量读凭据）
+> 文档基于 2026-09-09 真实环境全量验证（单元 146 测试 + 20 项真实端到端全通过）。
+> 相关文档：[v1 设计](superpowers/specs/2026-08-31-sjtu-llm-gateway-design.md) · [v2 聚合层设计](superpowers/specs/2026-09-06-aggregation-layer-design.md) · [VPN spike 结论](superpowers/notes/2026-08-31-vpn-spike.md)
 
 ---
 
-## 1. 架构概览
+## 目录
+
+1. [架构](#1-架构)
+2. [快速开始](#2-快速开始)
+3. [端点参考](#3-端点参考)
+4. [聚合语义](#4-聚合语义)
+5. [故障切换与限速](#5-故障切换与限速)
+6. [配置参考](#6-配置参考)
+7. [环境变量](#7-环境变量)
+8. [上游交大 API 实测参考](#8-上游交大-api-实测参考)
+9. [部署与运维](#9-部署与运维)
+10. [测试](#10-测试)
+
+## 1. 架构
 
 ```
-本机应用（OpenAI SDK / 任意兼容客户端）
-   │  http://127.0.0.1:8000/v1 （Bearer GATEWAY_API_KEY）
+本机应用（OpenAI SDK / 任意兼容客户端 / Claude Code 等）
+   │  http://127.0.0.1:8000/v1   Bearer GATEWAY_API_KEY（可关）
    ▼
-gateway 容器（FastAPI）── 候选供应商链：sjtu(P1) → deepseek(P2) → …可配置
-   │ 共享网络命名空间 (network_mode: service:vpn)
-   ▼
-vpn 容器（strongSwan IKEv2）
-   └─ 仅 202.120.0.0/16 + models.sjtu.edu.cn IP 走隧道（路由表 220 分流），其余直连
+┌─ gateway 容器（FastAPI，Python 3.13）─────────────────────┐
+│ ①鉴权 → ②模型解析(候选链) → ③上下文过滤(窗口/413)          │
+│ → ④熔断半开探测 → ⑤主动限速 → ⑥转发(经隧道/直连)           │
+│ → ⑦宽切换/熔断 → ⑧协议归一(model回写/think改投) → 客户端   │
+│    X-Gateway-Provider / X-Gateway-Context-Limit / /stats  │
+└──────────────┬─────────────────────────────────────────────┘
+               │ 共享网络命名空间 (network_mode: service:vpn)
+┌─ vpn 容器（strongSwan IKEv2）──────────────────────────────┐
+│ eap-mschapv2(jAccount) → stu.vpn.sjtu.edu.cn               │
+│ 服务端强制 TS 0/0 → table 220 手工分流：仅 202.120.0.0/16   │
+│ + models.sjtu.edu.cn IP 走隧道，其余直连；30s 探测自愈+DPD  │
+└────────────────────────────────────────────────────────────┘
 ```
+
+模块划分（`gateway/app/`）：`main`（端点/鉴权/头注入）→ `forward`（转发引擎/宽切换）→ `providers`（候选链）→ `estimate`（token 估算）→ `config`（配置/窗口表/单调校验）→ `normalize`（归一 + 流式状态机）→ `failover`（错误分类/熔断半开）→ `ratelimit`（令牌桶）→ `stats`（计数）→ `security`（SSRF 双重校验）。
 
 宿主机只暴露 `127.0.0.1:8000`（Compose 端口发布），容器外不可访问。
 
@@ -28,219 +48,236 @@ vpn 容器（strongSwan IKEv2）
 
 ```bash
 cp .env.example .env && cp config.example.yaml config.yaml   # 填密钥
-docker compose up -d
-curl http://127.0.0.1:8000/health                             # 免鉴权健康检查
+docker compose up -d --build          # 注意 --build：代码更新后必须重建镜像
+curl http://127.0.0.1:8000/health     # 免鉴权健康检查（"available":true ×2 即就绪）
 
+# 第一次调用
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_API_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-OpenAI SDK 用法：
+OpenAI SDK：
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="<GATEWAY_API_KEY>")
-resp = client.chat.completions.create(model="deepseek-chat",
-                                      messages=[{"role": "user", "content": "你好"}])
+r = client.chat.completions.create(model="deepseek-chat",
+                                   messages=[{"role": "user", "content": "你好"}])
 ```
 
-## 3. 认证
+## 3. 端点参考
 
-| 环境变量 | 行为 |
+### 3.1 `POST /v1/chat/completions`
+
+请求体与 OpenAI Chat Completions 一致，网关透传全部参数（`model` 按映射改写后转发）。上游参数支持度见 §8.2。
+
+**响应头**：
+
+| 头 | 含义 |
 |---|---|
-| `GATEWAY_API_KEY` 为空（默认） | 不鉴权（仅本机可达） |
-| `GATEWAY_API_KEY` 非空 | 除 `/health` 外所有端点要求 `Authorization: Bearer <key>`，错误返回 401（OpenAI 错误格式） |
+| `X-Gateway-Provider` | 实际服务者：供应商名 / `local`（本地生成错误）/ `config`（静态目录） |
+| `X-Gateway-Context-Limit` | 实际服务者对该模型的上下文窗口（仅成功响应） |
 
-上游各供应商的真实密钥由网关按 `api_key_env` 从环境变量注入，**客户端永远接触不到**。
+**非流式**：上游响应经归一（见 §4.3）后返回——`model` 为客户端请求名，minimax 的思考在 `reasoning_content`。
 
-## 4. 端点参考
+**流式**（`stream: true`）：`text/event-stream` 逐事件透传 + 归一，结尾 `data: [DONE]`；`stream_options.include_usage` 可用。流中断时错误透传且该供应商熔断 15s（不会重复输出）。
 
-### 4.1 `POST /v1/chat/completions`
+### 3.2 `GET /v1/models`
 
-透传 OpenAI Chat Completions 请求体（仅替换 `model` 为映射后的上游名、重写 `Authorization`）。支持流式与非流式。
+**聚合语义**：返回网关配置的客户端可见模型名并集（不透传上游），每项附非标准扩展字段：
 
-**请求**（字段与 OpenAI 一致）：
+```json
+{"object": "list", "data": [
+  {"id": "deepseek-chat", "object": "model", "owned_by": "gateway", "context_window": 262144},
+  {"id": "minimax",       "object": "model", "owned_by": "gateway", "context_window": 196608}
+]}
+```
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `model` | string，必填 | 客户端可见模型名，见 §6.1；不在任何供应商清单 → 404 `model_not_found` |
-| `messages` | array | 角色 system/user/assistant/tool、多轮、图片 `image_url`(base64) 均透传 |
-| `stream` | bool | `true` 时 SSE 透传，见下 |
-| 其余参数 | — | `temperature`、`tools`、`response_format`、`stop`、`n`、`max_tokens` 等全部透传，上游支持度见 §6.2 |
+`context_window` 取"最优先可服务该模型的供应商"的窗口；`X-Gateway-Provider: config`；不发起任何上游请求。
 
-**非流式响应**：上游响应（经 v2 归一，见 §6 开头）+ 响应头 `X-Gateway-Provider: <实际服务者>`；成功时另带 `X-Gateway-Context-Limit: <服务者对该模型的上下文窗口>`。
-
-**流式响应**：`text/event-stream`，逐块透传，结尾 `data: [DONE]`；`stream_options.include_usage` 可用。响应头同样带 `X-Gateway-Provider`；成功时同样带 `X-Gateway-Context-Limit`。
-
-**故障切换语义**（对客户端透明）：
-
-| 上游情况 | 网关行为 |
-|---|---|
-| 429 | 该供应商熔断 60s，立即换下一候选重试 |
-| 配额类（402，或任意 4xx 响应体含 quota/insufficient/balance/exhausted/额度/配额） | 熔断 30min，换下一候选 |
-| 5xx / 连接失败 / 超时 / SSRF 校验失败 | 熔断 15s，换下一候选 |
-| 4xx（请求本身问题） | 原样透传，不切换 |
-| 流式已开始（首块已发出）后中断 | 不重试（避免重复输出），透传错误并将该供应商熔断 15s |
-| 主动限速排队 > 2s（仅配置了限速的供应商，默认交大 9 次/分） | 软饱和跳过，直接下一候选 |
-| 请求估算 token 超过候选上下文窗口 | 窗口不足的候选被剔除（不打该上游、不占熔断/令牌额度）；全部候选都装不下 → 本地 413 `context_length_exceeded`（零上游调用） |
-| 全部候选耗尽 | 本地 502，见错误表 |
-
-熔断到期真半开恢复（冷却到期先只放一个探测请求，应答成功才全量恢复）；交大永远第一优先级（省钱优先）。
-
-### 4.2 `GET /v1/models`
-
-返回配置目录聚合：遍历全部已配置供应商（不论实时可用性——目录反映配置而非健康），取 `models` 与 `model_map` 客户端可见键的并集排序。每项含 `context_window`，取最优先（`priority` 最小）可服务该模型的供应商的窗口解析值（解析顺序：`model_contexts` → `context_window` → 内置表 → 8192，见 §5.1），与 chat 实际路由语义一致。响应头 `X-Gateway-Provider: config`；**不请求上游 `/models`**。
-
-### 4.3 `GET /health`（免鉴权）
+### 3.3 `GET /health`（免鉴权）
 
 ```json
 {"status": "ok", "providers": {
-  "sjtu":     {"available": true,  "breaker_open": false, "cooldown_remaining": 0.0, "unavailable_reason": null},
-  "deepseek": {"available": true,  "breaker_open": false, "cooldown_remaining": 0.0, "unavailable_reason": null}
+  "sjtu":     {"available": true, "breaker_open": false, "cooldown_remaining": 0.0, "unavailable_reason": null},
+  "deepseek": {"available": true, "breaker_open": false, "cooldown_remaining": 0.0, "unavailable_reason": null}
 }}
 ```
 
-### 4.4 `GET /stats`
+`available=false` 表示该供应商的密钥环境变量缺失；`breaker_open=true` 表示熔断中（`cooldown_remaining` 为剩余秒数，半开探测中也显示 open）。
 
-每供应商计数器（自进程启动累计）：`requests / success / rate_limited / quota / server_errors / network_errors / switched_away / soft_saturated`。
+### 3.4 `GET /stats`
 
-### 4.5 错误格式（本地生成，OpenAI 风格）
+每供应商累计计数：`requests / success / rate_limited / quota / server_errors / network_errors / switched_away / soft_saturated`。
+
+### 3.5 错误格式（本地生成，OpenAI 风格）
 
 | HTTP | code | 场景 |
 |---|---|---|
-| 400 | `invalid_request_error` | 请求体缺 `model` 字段 / JSON 解析失败 |
-| 401 | `invalid_request_error` | 网关密钥缺失或错误 |
+| 400 | `invalid_request_error` | 缺 `model` 字段 / JSON 解析失败 |
+| 401 | `invalid_request_error` | 网关密钥缺失/错误（仅 `/health` 豁免） |
 | 404 | `model_not_found` | 模型名不在任何供应商清单 |
-| 413 | `context_length_exceeded` | 请求估算 token 超过所有候选供应商的上下文窗口（零上游调用，message 附各家窗口清单） |
-| 502 | `all_providers_failed` | 候选链全部不可用（熔断/网络/软饱和） |
+| 413 | `context_length_exceeded` | 估算 token 超过**所有**候选窗口（message 含估算值与窗口清单，零上游调用，毫秒级返回） |
+| 502 | `all_providers_failed` | 候选全部不可用（熔断/软饱和/网络，含上下文剔除后仅剩者熔断的场景） |
 
-所有响应（含错误）均带 `X-Gateway-Provider` 头：`sjtu`/`deepseek`/…/`local`（本地生成）/`config`（`/v1/models` 目录聚合）。成功路径（含流式）另带 `X-Gateway-Context-Limit` 头披露实际服务者对该模型的上下文窗口。
+## 4. 聚合语义（v2）
 
-## 5. 配置参考
+### 4.1 上下文感知路由
 
-### 5.1 `config.yaml`（挂载到容器 `/app/config.yaml`，gitignore）
+1. **窗口声明**：每供应商 `context_window` + 按模型 `model_contexts`；缺省用内置表（交大实测：deepseek/qwen 系 262144、minimax 系 196608；其它供应商**必须显式配置**——裸模型名会被兜成交大值导致误路由）。
+2. **请求估算**：`中文段字符×0.6 + ASCII×0.25，×1.1 安全系数，+ 每消息 4，+ max_tokens`。字符启发式，刻意保守（重复字符类输入会高估——宁可错剔不少放）。
+3. **链过滤**：估算 > 窗口的供应商**在熔断/限速之前**被剔除（trace 记 `context_too_large`）；全部被剔除 → 本地 413。
+4. **兜底单调校验**：同一模型若兜底窗口 < 更优先者，启动 `WARNING`（提示选型，不阻断）。
+
+实测（2026-09-09）：143K 请求 → deepseek 官方(131072)被剔除、由 sjtu(262144) 服务；330K 请求 → 28ms 本地 413。
+
+### 4.2 模型目录聚合
+
+`/v1/models` 即目录（见 §3.2）；新增供应商/模型只改配置不改代码。
+
+### 4.3 协议归一
+
+| 归一项 | 非流式 | 流式 |
+|---|---|---|
+| `model` 回写客户端请求名 | ✅ | ✅ 逐 SSE 事件 |
+| minimax `<think>…</think>` → `reasoning_content` | ✅ 剥离（闭合后 lstrip） | ✅ 两态状态机（闭合标签跨 chunk 缓冲；不 lstrip，不丢字节） |
+
+归一**只应用于成功响应**（4xx 透传保持原貌）；一切归一异常（坏 JSON、未配对代理等）降级为原样字节透出 + warning 日志——绝不因归一丢数据或把 200 变错误。流式 `<think>` 开标签跨事件分裂、非首增量的迟到 `<think>` 不识别（原样透出，已裁决行为）。
+
+## 5. 故障切换与限速
+
+**宽切换矩阵**（对客户端透明，切换只发生在首字节写出之前）：
+
+| 上游情况 | 处置 | 熔断 |
+|---|---|---|
+| 429 | 换下一候选 | 60s |
+| 配额（402 或任意 4xx 响应体含 quota/insufficient/balance/exhausted/额度/配额） | 换下一候选 | 30min |
+| 5xx / 连接失败 / 超时 / DNS 故障 / SSRF 校验失败 | 换下一候选 | 15s |
+| 其它 4xx（请求问题） | **原样透传，不切换** | 无 |
+| 流式首块前失败 | 换下一候选 | 按类 |
+| 流式已开始后中断 | 透传错误（不重复输出） | 15s |
+| 上下文窗口不足 | 该供应商剔除本请求 | — |
+| 全候选耗尽 | 413（全因窗口）或 502 | — |
+
+**熔断恢复（半开）**：冷却到期只放**一个探测请求**（并发者继续走备用），任一响应成功即恢复；探测异常退出有防卡死守卫。
+
+**主动限速**（对配置了 `proactive_rate_limit` 的供应商，默认交大）：令牌桶 9 次/分（burst 3），排队上限 2s——超时即软饱和漫游备用，实测可让上游 429 完全不发生。
+
+**优先级**：交大永远第一（免费优先）；备用仅在其暂不可用/吃不下时服务。
+
+## 6. 配置参考
+
+### 6.1 `config.yaml`（完整字段）
 
 ```yaml
-listen_host: 0.0.0.0        # 容器内必须 0.0.0.0；宿主侧仅 127.0.0.1 暴露
+listen_host: 0.0.0.0        # 容器内必须 0.0.0.0；仅 python -m app.main 本地直跑时生效
 listen_port: 8000
-providers:
-  - name: sjtu
+
+providers:                  # 按此格式可加任意 OpenAI 兼容上游
+  - name: sjtu              # 供应商名（X-Gateway-Provider 与日志用）
     base_url: https://models.sjtu.edu.cn/api/v1
-    api_key_env: SJTU_API_KEY            # 密钥只从环境变量读，绝不写进配置
+    api_key_env: SJTU_API_KEY       # 密钥环境变量名（绝不写值）
     models: [deepseek-chat, deepseek-reasoner, minimax, minimax-m2.7, qwen, qwen3.6-27b, claw]
-    priority: 1                           # 越小越优先
-    proactive_rate_limit:                 # 可选：主动限速（防打爆上游 10 次/分）
-      requests_per_minute: 9              # 必须为正数
-      max_wait_seconds: 2                 # 排队超过即漫游备用
+    priority: 1                    # 越小越优先；同模型跨供应商按此排序
+    context_window: 262144         # 可选：供应商级窗口；缺省用内置表
+    model_contexts: { minimax: 196608 }   # 可选：按模型覆盖
+    proactive_rate_limit:          # 可选：主动限速
+      requests_per_minute: 9       # 必须为正
+      max_wait_seconds: 2
       burst: 3
   - name: deepseek
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
     models: [deepseek-chat, deepseek-reasoner]
     priority: 2
-    context_window: 131072          # 可选：该供应商的上下文窗口（DeepSeek 官方 128K）
-                                     # 不配则按客户端可见模型名查内置表（交大实测值），未命中按 8192
-    # model_contexts: { minimax: 200000 }  # 可选：按模型精细覆盖，优先于 context_window
-  # 任意 OpenAI 兼容上游按此格式追加；模型名不同时用 model_map 映射：
-  # - name: other
-  #   base_url: https://example.com/v1
-  #   api_key_env: OTHER_API_KEY
-  #   model_map: { minimax: "上游实际名", qwen: "上游实际名" }
-  #   priority: 3
+    context_window: 131072  # 非 sjtu 供应商务必显式声明！
+    # model_map: { minimax: "上游实际模型名" }   # 模型名不同时的映射（同时注册该模型到目录）
+
 failover:
   cooldown_429_seconds: 60
   cooldown_quota_seconds: 1800
   cooldown_network_seconds: 15
   connect_timeout_seconds: 10
-  read_timeout_seconds: 600               # 长推理（reasoner）需要长超时
+  read_timeout_seconds: 600       # reasoner 长推理需要
 ```
 
-规则：`base_url` 仅允许 http/https 且不得解析到环回/私有/保留地址（配置加载与每次请求双重校验）；`api_key_env` 指向的环境变量缺失时该供应商标记不可用（启动日志告警），不阻断启动；新增上游**无需改代码**。
+**加载校验**：`base_url` 仅 http/https 且不得解析到环回/私有/保留地址（双重：加载时 + 每请求时）；路径只允许工作目录/`/app`/临时目录；`api_key_env` 缺失 → 供应商标记不可用（启动 WARNING）不阻断；`requests_per_minute/burst` 必须为正；窗口兜底单调性 WARNING。
 
-### 5.2 `.env`（gitignore，compose 注入）
+### 6.2 上下文窗口解析顺序
 
-| 变量 | 用途 |
-|---|---|
-| `SJTU_API_KEY` | 交大模型服务密钥（申请见交我办） |
-| `DEEPSEEK_API_KEY` | 备用 DeepSeek 官方密钥（可选） |
-| `GATEWAY_API_KEY` | 网关本地鉴权密钥（空=不鉴权） |
-| `VPN_USERNAME` / `VPN_PASSWORD` | jAccount 凭据（vpn 容器建隧道） |
-| `VPN_SERVER`（默认 `stu.vpn.sjtu.edu.cn`） | IKEv2 网关 |
-| `VPN_ROUTE_SUBNETS`（默认 `202.120.0.0/16`） | 走隧道的网段（逗号分隔） |
-| `VPN_EXTRA_HOSTS`（默认 `models.sjtu.edu.cn`） | 额外按域名解析并入隧道的 /32 |
+`model_contexts[model]` → `context_window` → 内置表（交大实测值）→ 8192。
 
-## 6. 上游交大 API 实测参考（2026-08-31 实测）
+## 7. 环境变量
 
-**网关 v2 归一行为**：上游响应的 `model` 字段一律回写为客户端请求的模型名；minimax 系回复内嵌的 `<think>…</think>` 前缀改投 `reasoning_content`（闭合后的正文回到 `content`），流式增量与非流式同样适用——客户端无需感知各家上游差异。唯一细微差异：非流式会去除闭合标签后的前导空白（lstrip），流式按原样增量保留（不丢字节优先）。
-
-### 6.1 模型
-
-| 调用名 | 说明 | 实测表现 |
+| 变量 | 用途 | 默认 |
 |---|---|---|
-| `deepseek-chat` | DeepSeek V4 Flash 非思考 | TTFT ~1.4s，18–31 tok/s |
-| `deepseek-reasoner` | DeepSeek V4 Flash 思考（返回 `reasoning_content`） | 直连 ~16 tok/s |
-| `minimax` / `minimax-m2.7` | MiniMax-M2.7（回复内嵌 `<think>`，流式含 reasoning token） | 10–21 tok/s |
-| `qwen` / `qwen3.6-27b` | Qwen3.6-27B 多模态（base64 图片实测可用） | 15–17 tok/s |
-| `claw` | **文档未记载**，DeepSeek 系带思考，vllm tp8 部署 | 可用 |
-| `glm` / `glm-5.2` | litellm 配置中存在 | 403（当前团队仅授权 `public-models` 组，需向 hpc@sjtu.edu.cn 申请） |
+| `SJTU_API_KEY` | 交大密钥（必需） | — |
+| `DEEPSEEK_API_KEY` | 备用 DeepSeek 官方 | 未设则该供应商不可用 |
+| `GATEWAY_API_KEY` | 网关鉴权；**空=不鉴权**（仅本机可达） | 空 |
+| `VPN_USERNAME` / `VPN_PASSWORD` | jAccount（vpn 容器） | 必填 |
+| `VPN_SERVER` | IKEv2 网关 | `stu.vpn.sjtu.edu.cn` |
+| `VPN_ROUTE_SUBNETS` | 走隧道的网段 | `202.120.0.0/16` |
+| `VPN_EXTRA_HOSTS` | 额外解析并入隧道的域名 | `models.sjtu.edu.cn` |
 
-### 6.2 OpenAI 参数支持度（实测）
+## 8. 上游交大 API 实测参考
 
-- **行为实证支持**：`stop`、`n`、`max_tokens`、`max_completion_tokens`、`logprobs`+`top_logprobs`、`response_format`（json_object 与 json_schema 均严格生效）、`tools`+`tool_choice(auto/none)`、`temperature=0`（确定性）、`system` 角色、图片 `image_url`、`reasoning_content`、`stream_options.include_usage`
-- **接受（推断有效/忽略）**：`top_p`、`top_k`、`presence_penalty`、`frequency_penalty`、`user`、`parallel_tool_calls`、`developer` 角色、多轮 `assistant`、`tool` 角色回传、`reasoning_effort`、`service_tier`/`store`/`metadata`（≈忽略）
-- **注意**：`seed` 接受但**不保证可复现**（需要确定性请用 `temperature=0`）；旧版 `functions`/`function_call` 接受但**无效**（请用 `tools`）；`logit_bias` **400 拒绝**（上游投机解码不支持）
+### 8.1 模型（2026-09 实测）
 
-### 6.3 限速（实测）
-
-| 维度 | 限额 | 实测行为 |
+| 调用名 | 说明 | 实测 |
 |---|---|---|
-| 请求数 | 10 次/分钟 | 滚动 60s 窗口：并发第 9 个请求起 429，429 不占额度，约 30s 自动恢复 |
-| token | 300,000/分钟 | 未触达 |
-| 周配额 | 1,000,000,000/周 | 未触达；API key 有效期至 2026-09-30 |
+| `deepseek-chat` | DeepSeek V4 Flash | TTFT ~1.4s，18–31 tok/s，256K |
+| `deepseek-reasoner` | 思考模式（`reasoning_content`） | ~16 tok/s，256K |
+| `minimax` / `minimax-m2.7` | MiniMax-M2.7（原生思考） | 10–21 tok/s，192K |
+| `qwen` / `qwen3.6-27b` | Qwen 多模态（base64 图片✅） | 15–17 tok/s，256K |
+| `claw` | **未记载**，DeepSeek 系思考，vllm tp8 | 可用 |
+| `glm` / `glm-5.2` | litellm 配置存在 | 403（需申请授权） |
 
-网关默认主动限速 9 次/分 + 排队 2s 上限，实测可让上游 429 完全不发生。
+### 8.2 OpenAI 参数支持度（实测）
 
-## 7. 部署与运维
+- **行为实证**：`stop` `n` `max_tokens` `max_completion_tokens` `logprobs(+top)` `response_format`(json_object/json_schema) `tools`+`tool_choice`(auto/none) `temperature=0`(确定性) `system` `image_url` `stream_options.include_usage`
+- **接受（未证/忽略）**：`top_p` `top_k` `presence/frequency_penalty` `user` `parallel_tool_calls` `developer` 角色 多轮 `assistant` `tool` 回传 `reasoning_effort`；`service_tier/store/metadata`≈忽略
+- **注意**：`seed` 不保证可复现（用 temperature=0）；旧版 `functions` 无效（用 `tools`）；`logit_bias` **400**（上游投机解码）
+
+### 8.3 限速（实测）
+
+| 维度 | 值 | 实测行为 |
+|---|---|---|
+| 请求 | 10 次/分 | 滚动 60s 窗口：并发第 9 个起 429，约 30s 恢复，429 不占额度 |
+| token | 300K/分 | 未触达 |
+| 周 | 1B/周 | 未触达；key 有效期至 **2026-09-30**（注意续期） |
+
+网关主动限速 9 次/分 + 2s 排队上限，实测上游 429 零发生。
+
+## 9. 部署与运维
 
 ```bash
-docker compose up -d --build     # 全栈启动
+docker compose up -d --build     # ⚠️ 代码更新后必须 --build（up -d 不会重建）
 docker compose ps                # vpn 应 healthy
-docker compose logs -f gateway   # 结构化日志：model=/chain=/provider=/status=/elapsed_ms=/switch_trace=
-docker compose logs -f vpn       # 隧道协商/保活/路由
-curl -s http://127.0.0.1:8000/health
-curl -s -H "Authorization: Bearer $GATEWAY_API_KEY" http://127.0.0.1:8000/stats
-cd gateway && uv run pytest      # 146 个测试
+docker compose logs -f gateway   # 结构化：model=/chain=/provider=/status=/elapsed_ms=/switch_trace=
+docker compose logs -f vpn       # 隧道协商/保活/路由（TS、VIP、table 220）
+cd gateway && uv run pytest      # 146 个单元/集成测试
 ```
 
 **排障**：
 
 | 症状 | 处置 |
 |---|---|
-| 502 `all_providers_failed` | 查 `/stats`：`rate_limited`/`soft_saturated` → 等冷却（默认 60s）；`network_errors` → 查 vpn 日志与隧道 |
-| 某模型无备用 → 高峰期 502 | 给备用供应商加 `model_map` 映射该模型 |
-| vpn 容器反复重连 | 校外重建镜像需校园网 APT 源（或给 Dockerfile 传 `ARG APT_MIRROR`）；会话锁号最长约 8 分钟，keepalive 会自愈 |
-| 隧道在但流量不走隧道 | `docker compose exec vpn ip xfrm policy` 核对选择器与 table 220 路由的 src=VIP |
-| 日志排查 | 请求级切换原因在 `switch_trace=`（rate_limited/quota/server/network/ssrf/soft_saturated） |
+| 改了代码行为没变 | 镜像没重建——`docker compose up -d --build` |
+| 502 `all_providers_failed` | `/stats` 看 `rate_limited/soft_saturated`（等 60s 冷却）或 `network_errors`（查 vpn 日志） |
+| 413 `context_length_exceeded` | 请求确实超窗：换模型/裁剪，或评估给该模型配更大窗口的兜底 |
+| 某模型高峰 502 | 无兜底供应商服务该模型——给备用加 `model_map` |
+| vpn 反复重连 | 会话锁号最长 ~8 分钟自愈；校外重建镜像需校园网 APT 源（`ARG APT_MIRROR` 可覆盖） |
+| 疑似流量未走隧道 | `docker compose exec vpn ip xfrm policy`（选择器）/ `ip route show table 220`（src=VIP） |
+| 容器起不来 exec 报 no such file | Windows 检出 CRLF——`.gitattributes` 已强制 LF，重新检出：`git rm --cached -r . && git reset --hard` |
 
-**安全**：密钥仅经 `.env` 注入（gitignore），日志脱敏（结构化行不含任何密钥/Authorization 值）；上游地址双重 SSRF 校验；VPN 流量选择器只圈交大网段。
+**安全**：密钥仅 `.env`（gitignored）；日志脱敏（结构化行不含密钥/Authorization）；上游双重 SSRF 校验；配置路径白名单；VPN 仅交大网段走隧道；CA 唯一信任锚（ISRG Root X1）。
 
-## 8. 端到端示例
+## 10. 测试
 
-流式：
-
-```bash
-curl -sN http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","stream":true,"messages":[{"role":"user","content":"数到3"}]}'
-```
-
-函数调用（实测上游支持）：
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"上海天气？"}],
-       "tools":[{"type":"function","function":{"name":"get_weather",
-       "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}'
-```
+- **单元/集成**：`cd gateway && uv run pytest`（146：估算器/窗口/过滤/413/归一/状态机/熔断半开/流式生命周期/SSRF/鉴权/日志脱敏等；1 条已知第三方弃用 warning）。
+- **真实端到端**：`~/sjtu-probes/live_v2_test.py`（本地工具不入库）——20 项断言覆盖 models 聚合、上下文路由（143K/330K）、归一（非流式+流式）、响应头；另有 `probe_sjtu.py`（全模型可用性/速率）、`probe_openai_params.py`（参数支持度）：
+  ```bash
+  set -a; . ./.env; set +a; cd gateway && uv run python ~/sjtu-probes/live_v2_test.py
+  ```
+- **安全扫描**：mimosa 深度扫描 0 findings（seal `sha256:a8b79ddb…`，2026-09-09）。
