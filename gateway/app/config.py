@@ -29,6 +29,8 @@ class ProviderConfig:
     priority: int
     models: list[str] = field(default_factory=list)
     model_map: dict[str, str] = field(default_factory=dict)
+    context_window: int | None = None
+    model_contexts: dict[str, int] = field(default_factory=dict)
     proactive_rate_limit: RateLimitConfig | None = None
     available: bool = True
     unavailable_reason: str = ""
@@ -49,6 +51,38 @@ class AppConfig:
     listen_port: int = 8000
     providers: list[ProviderConfig] = field(default_factory=list)
     failover: FailoverConfig = field(default_factory=FailoverConfig)
+
+
+# FR10 内置上下文窗口表：按模型名维度，任何供应商的同名模型同样适用。
+# 不内置按供应商名的假设（如 DeepSeek 官方渠道 131072），由显式配置声明，避免误配。
+DEFAULT_CONTEXT_WINDOWS: dict[str, int] = {
+    "deepseek-chat": 262144,
+    "deepseek-reasoner": 262144,
+    "qwen": 262144,
+    "qwen3.6-27b": 262144,
+    "minimax": 196608,
+    "minimax-m2.7": 196608,
+}
+
+FALLBACK_CONTEXT_WINDOW = 8192
+
+
+def context_for(provider: ProviderConfig, model: str) -> int:
+    """解析 provider 对某（客户端可见）模型的上下文窗口。
+
+    优先级：model_contexts[model] → provider.context_window
+    → DEFAULT_CONTEXT_WINDOWS["provider:model"] → DEFAULT_CONTEXT_WINDOWS[model] → 8192。
+    """
+    if model in provider.model_contexts:
+        return provider.model_contexts[model]
+    if provider.context_window is not None:
+        return provider.context_window
+    qualified = f"{provider.name}:{model}"
+    if qualified in DEFAULT_CONTEXT_WINDOWS:  # 为将来 provider 级覆盖留口，当前内置表无此类键
+        return DEFAULT_CONTEXT_WINDOWS[qualified]
+    if model in DEFAULT_CONTEXT_WINDOWS:
+        return DEFAULT_CONTEXT_WINDOWS[model]
+    return FALLBACK_CONTEXT_WINDOW
 
 
 def _resolve_config_path(path: str) -> str:
@@ -85,6 +119,7 @@ def load_config(
     )
 
     for item in raw.get("providers", []):
+        raw_context_window = item.get("context_window")
         provider = ProviderConfig(
             name=str(item["name"]),
             base_url=str(item["base_url"]).rstrip("/"),
@@ -92,6 +127,8 @@ def load_config(
             priority=int(item["priority"]),
             models=[str(m) for m in item.get("models", [])],
             model_map={str(k): str(v) for k, v in item.get("model_map", {}).items()},
+            context_window=int(raw_context_window) if raw_context_window is not None else None,
+            model_contexts={str(k): int(v) for k, v in item.get("model_contexts", {}).items()},
         )
         rl = item.get("proactive_rate_limit")
         if rl:
@@ -124,4 +161,22 @@ def load_config(
     if not cfg.providers:
         raise ValueError("config.yaml 中没有任何 provider")
     cfg.providers.sort(key=lambda p: p.priority)
+
+    # FR10 单调校验：按客户端可见模型分组（models + model_map 键并集），
+    # 组内按 priority 升序；窗口严格变小只告警不拒绝（相等或递增都合法）。
+    groups: dict[str, list[ProviderConfig]] = {}
+    for provider in cfg.providers:
+        for model in set(provider.models) | set(provider.model_map):
+            groups.setdefault(model, []).append(provider)
+    for model, group in groups.items():
+        ordered = sorted(group, key=lambda p: p.priority)
+        prev = ordered[0]
+        for cur in ordered[1:]:
+            prev_window, cur_window = context_for(prev, model), context_for(cur, model)
+            if cur_window < prev_window:
+                logger.warning(
+                    "模型 %s 的兜底 %s 窗口 %d 小于 %s 的 %d",
+                    model, cur.name, cur_window, prev.name, prev_window,
+                )
+            prev = cur
     return cfg

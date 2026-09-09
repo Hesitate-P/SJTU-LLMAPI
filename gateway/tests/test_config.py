@@ -95,3 +95,119 @@ def test_config_path_inside_tmp_allowed(tmp_path):
     path.write_text(YAML, encoding="utf-8")
     cfg = load_config(str(path), environ={"SJTU_API_KEY": "k", "DEEPSEEK_API_KEY": "k"}, resolver=RES)
     assert cfg.providers
+
+
+def test_context_resolution_priority(tmp_path):
+    from app.config import context_for
+
+    path = tmp_path / "windows.yaml"
+    path.write_text(
+        """
+providers:
+  - name: A
+    base_url: https://a.test/v1
+    api_key_env: K1
+    models: [m1, m2]
+    priority: 1
+    context_window: 100000
+    model_contexts:
+      m1: 50000
+  - name: sjtu
+    base_url: https://models.sjtu.edu.cn/api/v1
+    api_key_env: K2
+    models: [deepseek-chat, minimax]
+    priority: 2
+  - name: C
+    base_url: https://c.test/v1
+    api_key_env: K3
+    models: [unknown-model]
+    priority: 3
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config(str(path), environ={"K1": "k", "K2": "k", "K3": "k"}, resolver=RES)
+    a, sjtu, c = cfg.providers
+    # model_contexts > context_window > 内置表 > 8192
+    assert context_for(a, "m1") == 50000
+    assert context_for(a, "m2") == 100000
+    assert context_for(sjtu, "deepseek-chat") == 262144
+    assert context_for(sjtu, "minimax") == 196608
+    assert context_for(c, "unknown-model") == 8192
+
+
+def test_monotonic_warning(tmp_path, caplog):
+    import logging
+
+    def load(text):
+        path = tmp_path / "config.yaml"
+        path.write_text(text, encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="gateway"):
+            return load_config(str(path), environ={"SJTU_API_KEY": "k", "SMALL_KEY": "k"}, resolver=RES)
+
+    def window_warnings():
+        return [r for r in caplog.records if "窗口" in r.getMessage()]
+
+    # sjtu(256K 内置) → small(配置 65536)，同服务 deepseek-chat：严格变小 → 告警
+    load(
+        """
+providers:
+  - name: sjtu
+    base_url: https://models.sjtu.edu.cn/api/v1
+    api_key_env: SJTU_API_KEY
+    models: [deepseek-chat]
+    priority: 1
+  - name: small
+    base_url: https://small.test/v1
+    api_key_env: SMALL_KEY
+    models: [deepseek-chat]
+    priority: 2
+    context_window: 65536
+"""
+    )
+    records = window_warnings()
+    assert len(records) == 1
+    text = records[0].getMessage()
+    assert "deepseek-chat" in text
+    assert "sjtu" in text and "small" in text
+    assert "65536" in text and "262144" in text
+
+    # 窗口单调（兜底更大）时无该 WARNING
+    caplog.clear()
+    load(
+        """
+providers:
+  - name: sjtu
+    base_url: https://models.sjtu.edu.cn/api/v1
+    api_key_env: SJTU_API_KEY
+    models: [deepseek-chat]
+    priority: 1
+    context_window: 65536
+  - name: small
+    base_url: https://small.test/v1
+    api_key_env: SMALL_KEY
+    models: [deepseek-chat]
+    priority: 2
+"""
+    )
+    assert window_warnings() == []
+
+    # 窗口相等同样合法（只警告"严格变小"）
+    caplog.clear()
+    load(
+        """
+providers:
+  - name: sjtu
+    base_url: https://models.sjtu.edu.cn/api/v1
+    api_key_env: SJTU_API_KEY
+    models: [deepseek-chat]
+    priority: 1
+    context_window: 65536
+  - name: small
+    base_url: https://small.test/v1
+    api_key_env: SMALL_KEY
+    models: [deepseek-chat]
+    priority: 2
+    context_window: 65536
+"""
+    )
+    assert window_warnings() == []
