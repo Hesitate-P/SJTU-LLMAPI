@@ -15,6 +15,7 @@ import httpx
 from .config import AppConfig, ProviderConfig, context_for
 from .estimate import estimate_request_tokens
 from .failover import Breaker, ErrorKind, classify_status
+from .normalize import normalize_response
 from .providers import build_chain
 from .ratelimit import TokenBucket
 from .security import assert_safe_upstream_url
@@ -56,6 +57,19 @@ def _openai_error(message: str, err_type: str, code: str | None = None) -> bytes
 
 def _provider_key(provider: ProviderConfig) -> str:
     return os.environ.get(provider.api_key_env, "")
+
+
+def _normalize_non_stream(body: bytes, client_model: str) -> bytes:
+    """FR12 非流式 OK 响应归一：model 回写 + <think> 剥离后重序列化
+    （ensure_ascii=False 保中文原貌）。解析失败或非 dict → 原样 bytes
+    返回（降级，绝不抛）。"""
+    try:
+        j = json.loads(body)
+    except ValueError:  # JSONDecodeError / UnicodeDecodeError 都是 ValueError 子类
+        return body
+    if not isinstance(j, dict):
+        return body
+    return json.dumps(normalize_response(j, client_model), ensure_ascii=False).encode()
 
 
 class GatewayService:
@@ -192,6 +206,10 @@ class GatewayService:
                     if kind is ErrorKind.OK:
                         self.breaker.record_success(provider.name)  # 能应答即活着（半开探测成功）
                         resp.context_limit = context_for(provider, model)  # 披露实际服务者窗口
+                        if resp.stream is None and resp.body is not None:
+                            # FR12 非流式归一（CLIENT 透传不归一，保持错误原貌；
+                            # 流式归一属 FR13/Task 5）
+                            resp.body = _normalize_non_stream(resp.body, model)
                         if resp.stream is not None:
                             # 流式响应：client 所有权移交给流生成器，由其关闭
                             handed_over = True
